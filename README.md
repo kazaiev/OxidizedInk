@@ -1,4 +1,4 @@
-# oxidized-ink
+# OxidizedInk
 
 An EPUB e-book reader for the Soldered **Inkplate 6**, written in Rust.
 Books are parsed and laid out on the device itself. Copy `.epub` files to the
