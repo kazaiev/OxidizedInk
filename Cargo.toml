@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["core"]
+# The firmware targets the ESP32 (Xtensa) with its own toolchain, so it is
+# built separately from inside `firmware/`.
+exclude = ["firmware"]
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

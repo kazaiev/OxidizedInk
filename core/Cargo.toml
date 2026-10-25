@@ -1,0 +1,9 @@
+[package]
+name = "inkreader-core"
+version = "0.1.0"
+edition = "2021"
+description = "Platform-independent e-reader logic: EPUB parsing, layout, rendering and UI"
+
+[dependencies]
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+ab_glyph = { version = "0.2", default-features = false, features = ["libm"] }
