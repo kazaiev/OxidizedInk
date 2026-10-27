@@ -1,0 +1,10 @@
+[package]
+name = "inkreader-sim"
+version = "0.1.0"
+edition = "2021"
+description = "Runs the reader core on a PC: in a window, or headless writing PNGs"
+
+[dependencies]
+inkreader-core = { path = "../core" }
+minifb = "0.29.0"
+png = "0.18.1"

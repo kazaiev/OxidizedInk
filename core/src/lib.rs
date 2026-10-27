@@ -3,9 +3,16 @@
 #![no_std]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 pub mod epub;
+pub mod fonts;
+pub mod layout;
+pub mod render;
+pub mod settings;
 pub mod text;
+pub mod ui;
 pub mod xml;
 pub mod zip;
 

@@ -49,6 +49,9 @@ pub struct Chapter {
     pub blocks: Vec<Block>,
     /// `id` attribute -> index of the block it starts in (for TOC fragments).
     pub anchors: Vec<(String, usize)>,
+    /// Sorted indices of blocks that must start a new page, such as chapter
+    /// starts listed in the table of contents. Set by the reader, not parsed.
+    pub breaks: Vec<usize>,
 }
 
 impl Chapter {
@@ -219,6 +222,16 @@ pub fn parse_xhtml(doc: &str) -> Chapter {
                     b.line_break();
                     continue;
                 }
+                if n == "img" {
+                    // Illustrated editions set a chapter's first letter as an
+                    // image (a drop cap) whose alt text is the letter.
+                    let alt = xml::attr(attrs, "alt").map(xml::decode_entities).unwrap_or_default();
+                    let alt = alt.trim();
+                    if !alt.is_empty() && alt.chars().count() <= 3 && !alt.contains(char::is_whitespace) {
+                        b.push_text(alt, false);
+                    }
+                    continue;
+                }
                 if matches!(n, "td" | "th") {
                     b.push_text(" ", false);
                     continue;
@@ -311,5 +324,15 @@ mod tests {
         assert_eq!(c.blocks[1].style_at(10), 0);
         assert_eq!(c.blocks[2].kind, BlockKind::Rule);
         assert_eq!(c.blocks[3].text, "• a");
+    }
+
+    #[test]
+    fn drop_cap_alt_text() {
+        let c = parse_xhtml(
+            "<p><span><img alt=\"W\" src=\"w.png\"/></span>HEN the ladies</p>\
+             <p><img alt=\"\" src=\"a.jpg\"/><img alt=\"A long description\" src=\"b.jpg\"/>Text</p>",
+        );
+        assert_eq!(c.blocks[0].text, "WHEN the ladies");
+        assert_eq!(c.blocks[1].text, "Text");
     }
 }

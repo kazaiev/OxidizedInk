@@ -1,5 +1,7 @@
 # Inkplate 6 hardware notes
 
+> **Disclaimer**: Gathered with the help from Claude Opus
+
 These notes are for writing a bare-metal panel driver. They were checked against these sources:
 
 - **Soldered Arduino library:** master (11.2.0), 10.2.2, and legacy 8.0.0.

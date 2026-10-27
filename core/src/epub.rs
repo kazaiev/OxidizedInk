@@ -121,7 +121,7 @@ impl<F: ReadAt> Epub<F> {
         let opf_path = Tokenizer::new(&container)
             .find_map(|t| match t {
                 Token::Start { name, attrs, .. } if local_name(name) == "rootfile" => {
-                    xml::attr(attrs, "full-path").map(|p| percent_decode(p))
+                    xml::attr(attrs, "full-path").map(percent_decode)
                 }
                 _ => None,
             })
@@ -250,7 +250,7 @@ impl<F: ReadAt> Epub<F> {
                     "nav" if !self_closing => {
                         if in_toc {
                             nav_depth += 1;
-                        } else if xml::attr(attrs, "type").map_or(false, |t| t.contains("toc")) {
+                        } else if xml::attr(attrs, "type").is_some_and(|t| t.contains("toc")) {
                             in_toc = true;
                             nav_depth = 0;
                         }
