@@ -531,6 +531,21 @@ impl<S: Storage> App<S> {
         }
     }
 
+    /// Leaves any menu or list for the reading view (the library if no book
+    /// is open), as `start` would show it, e.g. before the device sleeps.
+    /// Returns true if the screen changed.
+    pub fn settle(&mut self) -> bool {
+        let target = if self.reader.is_some() { Screen::Reading } else { Screen::Library { sel: 0 } };
+        if (self.reader.is_none() && matches!(self.screen, Screen::Library { .. })) || self.screen == target {
+            return false;
+        }
+        if matches!(self.screen, Screen::Settings { .. }) {
+            self.relayout();
+        }
+        self.screen = target;
+        true
+    }
+
     fn show_library(&mut self) -> bool {
         self.scan_library();
         let sel = self

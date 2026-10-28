@@ -1,0 +1,40 @@
+[package]
+name = "inkreader-firmware"
+version = "0.1.0"
+edition = "2021"
+description = "ESP32 firmware for the Inkplate 6: hardware glue around inkreader-core"
+
+[[bin]]
+name = "inkreader"
+path = "src/main.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "bringup"
+path = "src/bringup.rs"
+test = false
+bench = false
+
+[dependencies]
+esp-hal = { version = "~1.2.2", features = ["esp32", "log-04", "unstable", "exception-handler"] }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32", "log-04"] }
+esp-alloc = { version = "0.11.0", features = ["esp32"] }
+esp-backtrace = { version = "0.20.0", features = ["esp32", "panic-handler", "println", "custom-pre-backtrace"] }
+esp-println = { version = "0.18.0", features = ["esp32", "log-04"] }
+critical-section = "1.2.0"
+log = "0.4.27"
+nb = "1.1.0"
+embedded-sdmmc = { version = "0.10.0", default-features = false }
+embedded-hal-bus = "0.3.0"
+inkreader-core = { path = "../core" }
+
+[profile.dev]
+# The unoptimized build is too slow and too big for the ESP32.
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+lto = "fat"
+opt-level = "s"
