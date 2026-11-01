@@ -1,4 +1,4 @@
-# oxidized-ink
+# OxidizedInk
 
 An EPUB e-book reader for the Soldered **Inkplate 6**, written in Rust.
 Books are parsed and laid out on the device itself. Copy `.epub` files to the
@@ -7,9 +7,10 @@ SD card and read.
 **Status:** work in progress. The reader runs on the Inkplate 6 V2. It shows
 the library from the SD card, opens books, turns pages, saves progress and
 settings, and deep sleeps when idle. Until the side buttons are wired, the
-wake button does everything. A PC simulator runs the same code. A 3D-printed
-case is drafted in `case/` but not printed yet. See [HANDOFF.md](HANDOFF.md)
-for the full plan and status.
+wake button does everything. A PC simulator runs the same code.
+
+See [OxidizedInk](
+https://alex.k4zka.online/projects/oxidized-ink/) for the full plan and status.
 
 ## Layout
 
