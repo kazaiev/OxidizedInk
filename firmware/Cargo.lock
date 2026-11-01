@@ -1024,6 +1024,7 @@ name = "inkreader-core"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "libm",
  "miniz_oxide",
 ]
 

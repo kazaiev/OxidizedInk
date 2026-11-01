@@ -157,6 +157,8 @@ impl Renderer {
                     }
                 }
                 &Item::Rule { x0, x1, y } => canvas.fill_rect(x0, y, x1 - x0, 1, BLACK),
+                // The reader draws pictures: they come from the book.
+                Item::Image { .. } => {}
             }
         }
     }

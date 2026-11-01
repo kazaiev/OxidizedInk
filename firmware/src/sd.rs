@@ -14,6 +14,7 @@ use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_sdmmc::{
     Directory, File, LfnBuffer, Mode, RawVolume, SdCard, ShortFileName, TimeSource, Timestamp, VolumeIdx, VolumeManager,
 };
+use embedded_sdmmc::filesystem::ToShortFileName;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_hal::peripherals::{GPIO12, GPIO13, GPIO14, GPIO15, SPI2};
@@ -125,7 +126,7 @@ impl Sd {
     }
 
     /// Reads a whole file, or `None` if it's missing or unreadable.
-    pub fn read_file(&self, path: &str, name: &str) -> Option<Vec<u8>> {
+    pub fn read_file<N: ToShortFileName>(&self, path: &str, name: N) -> Option<Vec<u8>> {
         let file = self.dir(path).ok()?.open_file_in_dir(name, Mode::ReadOnly).ok()?;
         let mut out = alloc::vec![0u8; file.length() as usize];
         let mut done = 0;

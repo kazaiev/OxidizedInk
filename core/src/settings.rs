@@ -22,7 +22,8 @@ pub const PARAGRAPHS: usize = 4;
 pub const STATUS_LINE: usize = 5;
 pub const PAGE_BUTTONS: usize = 6;
 pub const SLEEP: usize = 7;
-pub const FULL_REFRESH: usize = 8;
+pub const SLEEP_SCREEN: usize = 8;
+pub const FULL_REFRESH: usize = 9;
 
 /// Values behind the options, in the same order.
 const FONT_SIZES: [i32; 8] = [18, 20, 22, 24, 26, 28, 32, 36];
@@ -32,7 +33,7 @@ const MARGIN_PX: [(i32, i32); 3] = [(20, 20), (36, 28), (56, 40)];
 const SLEEP_MINUTES: [u32; 6] = [1, 2, 5, 10, 15, 30];
 const FULL_REFRESH_EVERY: [u32; 4] = [1, 5, 10, 20];
 
-pub const SETTINGS: [Setting; 9] = [
+pub const SETTINGS: [Setting; 10] = [
     Setting {
         key: "text_size",
         label: "Text size",
@@ -90,6 +91,13 @@ pub const SETTINGS: [Setting; 9] = [
         default: 2,
     },
     Setting {
+        key: "sleep_screen",
+        label: "Sleep screen",
+        help: "Shown while asleep. Pictures come from /SLEEP.",
+        options: &["Book cover", "Pictures", "Logo", "Page"],
+        default: 0,
+    },
+    Setting {
         key: "full_refresh",
         label: "Full refresh",
         help: "How often the whole screen flashes to clear ghosting.",
@@ -105,6 +113,20 @@ pub enum StatusLine {
     /// Page and percent only.
     Progress,
     Off,
+}
+
+/// What the screen shows while the device sleeps (unless the battery is
+/// low).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepShows {
+    /// The open book's cover.
+    Cover,
+    /// The pictures in `/SLEEP/` on the card, one after another.
+    Pictures,
+    /// The oxidized-ink logo.
+    Logo,
+    /// The page as it was.
+    Page,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +226,15 @@ impl Settings {
     /// Idle minutes before the device sleeps.
     pub fn sleep_minutes(&self) -> u32 {
         SLEEP_MINUTES[self.values[SLEEP] as usize]
+    }
+
+    pub fn sleep_shows(&self) -> SleepShows {
+        match self.values[SLEEP_SCREEN] {
+            0 => SleepShows::Cover,
+            1 => SleepShows::Pictures,
+            2 => SleepShows::Logo,
+            _ => SleepShows::Page,
+        }
     }
 
     /// One screen update in this many is a full refresh; the others change

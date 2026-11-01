@@ -97,20 +97,39 @@ impl<F: ReadAt> Zip<F> {
         if e.size as usize > MAX_ENTRY_SIZE {
             return Err(Error::Zip("entry too large"));
         }
-        let mut hdr = [0u8; 30];
-        self.file.read_at(e.local_offset as u64, &mut hdr)?;
-        if u32_at(&hdr, 0) != LOCAL_SIG {
-            return Err(Error::Zip("bad local header"));
-        }
-        let data_off =
-            e.local_offset as u64 + 30 + u16_at(&hdr, 26) as u64 + u16_at(&hdr, 28) as u64;
+        let offset = self.data_offset(e)?;
         let mut data = vec![0u8; e.compressed_size as usize];
-        self.file.read_at(data_off, &mut data)?;
+        self.file.read_at(offset, &mut data)?;
         match e.method {
             0 => Ok(data),
             8 => miniz_oxide::inflate::decompress_to_vec_with_limit(&data, MAX_ENTRY_SIZE)
                 .map_err(|_| Error::Zip("inflate failed")),
             _ => Err(Error::Zip("unsupported compression")),
         }
+    }
+
+    /// The first `len` bytes of an entry (fewer if it is shorter, or if it
+    /// compressed well), inflating only the start of it.
+    pub fn read_prefix(&mut self, name: &str, len: usize) -> Result<Vec<u8>, Error> {
+        let e = self.find(name).cloned().ok_or(Error::Zip("entry not found"))?;
+        let offset = self.data_offset(&e)?;
+        let mut data = vec![0u8; (e.compressed_size as usize).min(len)];
+        self.file.read_at(offset, &mut data)?;
+        match e.method {
+            0 => Ok(data),
+            // Inflating cut-off input fails, but keeps what it got.
+            8 => Ok(miniz_oxide::inflate::decompress_to_vec_with_limit(&data, len).unwrap_or_else(|e| e.output)),
+            _ => Err(Error::Zip("unsupported compression")),
+        }
+    }
+
+    /// Where an entry's data starts, after its local header.
+    fn data_offset(&mut self, e: &Entry) -> Result<u64, Error> {
+        let mut hdr = [0u8; 30];
+        self.file.read_at(e.local_offset as u64, &mut hdr)?;
+        if u32_at(&hdr, 0) != LOCAL_SIG {
+            return Err(Error::Zip("bad local header"));
+        }
+        Ok(e.local_offset as u64 + 30 + u16_at(&hdr, 26) as u64 + u16_at(&hdr, 28) as u64)
     }
 }

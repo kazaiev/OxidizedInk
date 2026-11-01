@@ -7,10 +7,15 @@
 //! Lines are broken greedily at spaces, after dashes inside words, and at soft
 //! hyphens. A word wider than the line is broken by character. Paragraph
 //! lines are justified except the last one, unless set ragged right.
+//!
+//! Pictures keep their own size in pixels, shrunk to fit the text's width
+//! and the page, with room left for a short caption, which stays with its
+//! picture. One that doesn't fit below the text starts the next page.
 
 use alloc::vec::Vec;
 
 use crate::fonts::{Fonts, Meter};
+use crate::image;
 use crate::text::{Block, BlockKind, Chapter};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -51,6 +56,9 @@ pub enum Item {
     Text(Line),
     /// A horizontal rule, in pixels.
     Rule { x0: i32, x1: i32, y: i32 },
+    /// Picture `index` of the chapter, `w`×`h` pixels with its top left at
+    /// `(x, y)`.
+    Image { index: u16, x: i32, y: i32, w: i32, h: i32 },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -161,7 +169,7 @@ impl<'f> Layout<'f> {
             BlockKind::Heading(3) => (body * 23 / 20, Align::Center),
             BlockKind::Heading(_) => (body, Align::Left),
             BlockKind::Pre => (body * 9 / 10, Align::Left),
-            BlockKind::Center => (body, Align::Center),
+            BlockKind::Center | BlockKind::Image(_) => (body, Align::Center),
             BlockKind::Para | BlockKind::Rule if self.justify => (body, Align::Justify),
             BlockKind::Para | BlockKind::Rule => (body, Align::Left),
         };
@@ -296,6 +304,48 @@ impl<'f> Layout<'f> {
         Line { block: bi as u32, baseline, px: st.px, runs, hyphen }
     }
 
+    /// The size the picture in block `i` is shown at: its own, or as big as
+    /// fits the block's width and the page, less its caption.
+    fn image_size(&self, ch: &Chapter, i: usize, st: &Style) -> (i32, i32) {
+        let BlockKind::Image(index) = ch.blocks[i].kind else { return (0, 0) };
+        let img = &ch.images[index as usize];
+        let (w, h) = (img.width as usize, img.height as usize);
+        let max_w = st.width.max(1) as usize;
+        let max_h = (self.height - self.caption_height(ch, i)).max(1) as usize;
+        let (w, h) = if w <= max_w && h <= max_h { (w, h) } else { image::fit(w, h, max_w, max_h) };
+        (w.max(1) as i32, h.max(1) as i32)
+    }
+
+    /// Height of the caption kept with the picture in block `i`, gaps
+    /// included: 0 if it has none, or one too long to keep with it.
+    fn caption_height(&self, ch: &Chapter, i: usize) -> i32 {
+        let BlockKind::Image(index) = ch.blocks[i].kind else { return 0 };
+        let last = (i + ch.images[index as usize].caption as usize).min(ch.blocks.len() - 1);
+        let mut h = 0;
+        for j in i + 1..=last {
+            let st = self.style(ch, j);
+            h += st.gap + self.block_height(&ch.blocks[j], &st);
+        }
+        // A heading keeps the line after it too.
+        if last > i && matches!(ch.blocks[last].kind, BlockKind::Heading(_)) && last + 1 < ch.blocks.len() {
+            let next = self.style(ch, last + 1);
+            h += next.gap + next.line_h;
+        }
+        if h > self.height / 3 {
+            0
+        } else {
+            h
+        }
+    }
+
+    /// Height of a block's first line, or of its picture and caption.
+    fn lead(&self, ch: &Chapter, i: usize, st: &Style) -> i32 {
+        match ch.blocks[i].kind {
+            BlockKind::Image(_) => self.image_size(ch, i, st).1 + self.caption_height(ch, i),
+            _ => st.line_h,
+        }
+    }
+
     /// Height of a whole block, for keeping a heading with the text after it.
     fn block_height(&self, b: &Block, st: &Style) -> i32 {
         let mut byte = 0;
@@ -325,10 +375,16 @@ impl<'f> Layout<'f> {
                 return Pos::new(bi, 0);
             }
             if byte == 0 && !empty {
-                let mut need = st.gap + st.line_h;
+                let mut need = st.gap + self.lead(ch, bi, &st);
                 if matches!(b.kind, BlockKind::Heading(_)) && bi + 1 < ch.blocks.len() {
                     let next = self.style(ch, bi + 1);
-                    need = st.gap + self.block_height(b, &st) + next.gap + next.line_h;
+                    let heading = st.gap + self.block_height(b, &st) + next.gap;
+                    need = heading + self.lead(ch, bi + 1, &next);
+                    // A heading and a picture too tall to share a page: keep
+                    // the heading with a line's worth instead.
+                    if need > self.height {
+                        need = heading + next.line_h;
+                    }
                 }
                 if y + need > bottom {
                     return Pos::new(bi, 0);
@@ -342,6 +398,14 @@ impl<'f> Layout<'f> {
                     out.push(Item::Rule { x0, x1: x0 + w, y: y + st.line_h / 2 });
                 }
                 y += st.line_h;
+                empty = false;
+            }
+            if let BlockKind::Image(index) = b.kind {
+                let (w, h) = self.image_size(ch, bi, &st);
+                if let Some(out) = out.as_deref_mut() {
+                    out.push(Item::Image { index, x: st.left + (st.width - w) / 2, y, w, h });
+                }
+                y += h;
                 empty = false;
             }
             // Center the font's ascent + descent in the line box.
@@ -394,4 +458,62 @@ impl<'f> Layout<'f> {
 /// Index of the page in `starts` that contains `pos`.
 pub fn page_of(starts: &[Pos], pos: Pos) -> usize {
     starts.partition_point(|&s| s <= pos).saturating_sub(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::text::{parse_xhtml, Image};
+
+    #[test]
+    fn pictures_fit_and_keep_their_captions() {
+        let fonts = Fonts::new();
+        let layout = Layout {
+            fonts: &fonts,
+            left: 30,
+            top: 20,
+            width: 540,
+            height: 730,
+            font_px: 24,
+            line_pct: 140,
+            justify: true,
+            spaced: false,
+        };
+        let size = |src: &str| {
+            let (width, height) = match src {
+                "tall.png" => (400, 3000),
+                "small.png" => (100, 50),
+                _ => (540, 660),
+            };
+            Some(Image { path: src.into(), width, height, caption: 0 })
+        };
+        // After a line of text the picture fits, but its caption doesn't.
+        let ch = parse_xhtml(
+            "<p>Text</p><div><img src=\"a.png\"/><p>Caption</p></div>\
+             <img src=\"tall.png\"/><p><img src=\"small.png\"/></p>",
+            size,
+        );
+        let pages: Vec<_> = layout.paginate(&ch).into_iter().map(|p| layout.page(&ch, p)).collect();
+        let images = |p: &Page| -> Vec<_> {
+            p.items
+                .iter()
+                .filter_map(|i| match *i {
+                    Item::Image { index, w, h, .. } => Some((index, w, h)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let lines = |p: &Page| p.items.iter().filter(|i| matches!(i, Item::Text(_))).count();
+        let shown: Vec<_> = pages.iter().map(|p| (images(p), lines(p))).collect();
+        assert_eq!(
+            shown,
+            [
+                (Vec::new(), 1),
+                ([(0, 540, 660)].into(), 1),
+                // Shrunk to the page; the small one after it keeps its size.
+                ([(1, 97, 730)].into(), 0),
+                ([(2, 100, 50)].into(), 0),
+            ]
+        );
+    }
 }

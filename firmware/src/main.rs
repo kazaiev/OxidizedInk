@@ -1,14 +1,16 @@
 //! OxidizedInk firmware for the Inkplate 6 V2.
 //!
-//! Boot puts the board in a safe state, powers the SD card and starts the
-//! reader core, which reopens the last book at its saved page. Each button
-//! press goes to the core, and the panel gets a partial refresh whenever the
-//! screen changes, and a full one every few changes (the "Full refresh"
-//! setting). After the idle time set in Settings, the board leaves any
-//! menu (or, on a low battery, puts up a "Battery low" screen), cuts SD power
-//! and deep sleeps. Any button wakes it; it boots again into the same page,
-//! and the press that woke it acts on that page. On an empty battery it shows
-//! "Battery empty" and sleeps again without opening the book.
+//! Boot puts the board in a safe state, shows the logo (after power-on, not
+//! after a sleep), powers the SD card and starts the reader core, which
+//! reopens the last book at its saved page. Each button press goes to the
+//! core, and the panel gets a partial refresh whenever the screen changes,
+//! and a full one every few changes (the "Full refresh" setting). After
+//! the idle time set in Settings, the board leaves any menu, puts up the
+//! sleep screen (the book's cover, a picture from the card, the logo, or
+//! "Battery low"; or it leaves the page), cuts SD power and deep sleeps.
+//! Any button wakes it; it boots again into the same page, and if the page
+//! was left up, the press that woke it acts on it. On an empty battery it
+//! shows "Battery empty" and sleeps again without opening the book.
 //!
 //! The page buttons on the side give Prev, Next and Menu, and holding Menu
 //! gives Back. The board's own wake button is not used (see `buttons`).
@@ -42,7 +44,8 @@ use esp_hal::time::{Duration, Instant, Rate};
 use esp_hal::Blocking;
 use inkreader_core::fonts::Fonts;
 use inkreader_core::render::{Canvas, Renderer};
-use inkreader_core::ui::{App, SleepScreen, Storage, HEIGHT, WIDTH};
+use inkreader_core::settings::Settings;
+use inkreader_core::ui::{draw_logo, App, SleepScreen, Storage, HEIGHT, WIDTH};
 use log::{info, warn};
 
 use battery::Battery;
@@ -146,14 +149,26 @@ impl Screen {
         }
         let t = Instant::now();
         app.draw(&mut self.canvas);
-        info!("drawn in {} ms", t.elapsed().as_millis());
+        info!("drawn in {} ms, {} KB free", t.elapsed().as_millis(), HEAP.free() / 1024);
         self.refresh(bus, full_every);
     }
 
     /// A sleep screen, with a full refresh.
     fn show_sleep<S: Storage>(&mut self, app: &mut App<S>, sleep: SleepScreen, bus: &mut Bus) {
+        let t = Instant::now();
         app.draw_sleep(&mut self.canvas, sleep);
+        info!("{:?} sleep screen drawn in {} ms, {} KB free", sleep, t.elapsed().as_millis(), HEAP.free() / 1024);
         self.refresh(bus, 1);
+    }
+
+    /// The logo, while the reader starts. The screen after it gets a full
+    /// refresh, so that no trace of the logo stays.
+    fn show_logo(&mut self, bus: &mut Bus) {
+        let t = Instant::now();
+        draw_logo(&mut self.canvas);
+        info!("logo drawn in {} ms", t.elapsed().as_millis());
+        self.refresh(bus, 1);
+        self.shown_known = false;
     }
 
     /// Takes the app's screen as what the panel already shows, without a
@@ -183,6 +198,13 @@ impl Screen {
 /// screens on a charged cell.
 fn test_battery() -> Option<u8> {
     option_env!("TEST_BATTERY").and_then(|v| v.parse().ok())
+}
+
+/// The idle time before sleep, in seconds: `TEST_IDLE` at build time, to
+/// try the sleep screens without waiting, or else the setting.
+fn idle_time(settings: &Settings) -> Duration {
+    let test = option_env!("TEST_IDLE").and_then(|v| v.parse().ok());
+    Duration::from_secs(test.unwrap_or(settings.sleep_minutes() as u64 * 60))
 }
 
 /// Reads the battery, logs it, and refreshes what the app shows about the
@@ -279,6 +301,9 @@ fn main() -> ! {
     }
     let mut battery = Battery::new(p.ADC1, p.GPIO35);
     info!("ADC reference: {} mV", battery.vref);
+    if !woke {
+        screen.show_logo(&mut bus);
+    }
 
     let card = match bus.exp1.set_output(&mut bus.i2c, pin::SD_POWER, false) {
         Ok(()) => {
@@ -310,38 +335,38 @@ fn main() -> ! {
                 app.start();
                 info!("reader started in {} ms", boot.elapsed().as_millis());
                 // If the panel still shows the page `settle` left there, the
-                // first refresh can be a partial one. The press that woke the
-                // board acts on the page.
+                // first refresh can be a partial one, and the press that woke
+                // the board acts on the page. After a sleep screen it just
+                // brings the page back.
+                let mut changed = false;
                 if at_sleep == SHOWS_PAGE {
                     let b = unsafe { STATUS_BATTERY_AT_SLEEP };
                     app.status_battery = (b <= 100).then_some(b);
                     screen.assume_shown(&mut app);
+                    changed = wake_press.is_some_and(|i| app.handle(i));
                 }
-                let changed = wake_press.is_some_and(|i| app.handle(i));
                 if at_sleep != SHOWS_PAGE || changed {
                     screen.show_app(&mut app, &mut bus);
                 }
-                loop {
-                    let idle = Duration::from_secs(app.settings().sleep_minutes() as u64 * 60);
-                    let Some(input) = buttons.wait(&mut bus, idle) else { break };
-                    info!("button: {:?}", input);
+                while let Some(input) = buttons.wait(&mut bus, idle_time(app.settings())) {
                     update_status(&mut battery, &mut bus, &mut app, card_mb);
                     if app.battery_empty() {
                         break;
                     }
-                    if app.handle(input) {
+                    let t = Instant::now();
+                    let changed = app.handle(input);
+                    info!("button: {:?}, handled in {} ms", input, t.elapsed().as_millis());
+                    if changed {
                         screen.show_app(&mut app, &mut bus);
                     }
                 }
-                match app.sleep_screen() {
-                    Some(sleep) => {
-                        screen.show_sleep(&mut app, sleep, &mut bus);
-                        if sleep == SleepScreen::BatteryEmpty {
-                            SHOWS_EMPTY
-                        } else {
-                            0
-                        }
-                    }
+                let sleep = app.sleep_screen();
+                if let Some(s) = sleep {
+                    screen.show_sleep(&mut app, s, &mut bus);
+                }
+                match sleep {
+                    Some(SleepScreen::BatteryEmpty) => SHOWS_EMPTY,
+                    Some(_) => 0,
                     None => {
                         if app.settle() {
                             screen.show_app(&mut app, &mut bus);

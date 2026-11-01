@@ -7,3 +7,7 @@ description = "Platform-independent e-reader logic: EPUB parsing, layout, render
 [dependencies]
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
 ab_glyph = { version = "0.2", default-features = false, features = ["libm"] }
+libm = "0.2"
+
+[dev-dependencies]
+png = "0.18.1"

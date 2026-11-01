@@ -3,10 +3,14 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use crate::text::{self, Chapter};
+use crate::text::{self, Chapter, Image};
 use crate::xml::{self, local_name, Token, Tokenizer};
 use crate::zip::Zip;
-use crate::{Error, ReadAt};
+use crate::{image, Error, ReadAt};
+
+/// How much of a picture is read to find its size. A JPEG whose frame
+/// header comes later, after large metadata, is read whole.
+const SIZE_PREFIX: usize = 8 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct SpineItem {
@@ -30,6 +34,8 @@ pub struct Epub<F: ReadAt> {
     pub author: String,
     pub spine: Vec<SpineItem>,
     pub toc: Vec<TocEntry>,
+    /// The cover picture's path inside the ZIP.
+    pub cover: Option<String>,
 }
 
 fn utf8(bytes: Vec<u8>) -> String {
@@ -65,6 +71,15 @@ fn dir_of(path: &str) -> &str {
     match path.rfind('/') {
         Some(i) => &path[..=i],
         None => "",
+    }
+}
+
+/// The width and height of the picture at `path`, if it is one we can show.
+fn picture_size<F: ReadAt>(zip: &mut Zip<F>, path: &str) -> Option<(u32, u32)> {
+    let head = zip.read_prefix(path, SIZE_PREFIX).ok()?;
+    match image::size(&head) {
+        None if head.len() == SIZE_PREFIX && head.starts_with(&[0xff, 0xd8]) => image::size(&zip.read(path).ok()?),
+        size => size,
     }
 }
 
@@ -114,6 +129,22 @@ struct ManifestItem {
     properties: String,
 }
 
+/// The cover picture: the EPUB 3 `cover-image`, the EPUB 2 metadata's
+/// cover item, or else a picture named like a cover.
+fn find_cover<'m>(manifest: &'m [ManifestItem], cover_id: Option<&str>) -> Option<&'m ManifestItem> {
+    let picture = |m: &&ManifestItem| m.media_type.starts_with("image/") && m.media_type != "image/svg+xml";
+    manifest
+        .iter()
+        .filter(picture)
+        .find(|m| m.properties.split_whitespace().any(|p| p == "cover-image"))
+        .or_else(|| manifest.iter().filter(picture).find(|m| Some(m.id.as_str()) == cover_id))
+        .or_else(|| {
+            manifest.iter().filter(picture).find(|m| {
+                m.id.to_ascii_lowercase().contains("cover") || m.href.to_ascii_lowercase().contains("cover")
+            })
+        })
+}
+
 impl<F: ReadAt> Epub<F> {
     pub fn open(file: F) -> Result<Self, Error> {
         let mut zip = Zip::open(file)?;
@@ -140,6 +171,7 @@ impl<F: ReadAt> Epub<F> {
         let mut manifest: Vec<ManifestItem> = Vec::new();
         let mut spine_ids: Vec<String> = Vec::new();
         let mut ncx_id: Option<String> = None;
+        let mut cover_id: Option<String> = None;
         let mut capture: Option<&'static str> = None;
         let mut buf = String::new();
 
@@ -166,6 +198,10 @@ impl<F: ReadAt> Epub<F> {
                         }
                     }
                     "spine" => ncx_id = xml::attr(attrs, "toc").map(|s| s.to_string()),
+                    // EPUB 2 names the cover's manifest item in metadata.
+                    "meta" if xml::attr(attrs, "name") == Some("cover") => {
+                        cover_id = xml::attr(attrs, "content").map(|s| s.to_string())
+                    }
                     _ => {}
                 },
                 Token::Text(t) if capture.is_some() => buf.push_str(t),
@@ -196,7 +232,8 @@ impl<F: ReadAt> Epub<F> {
             return Err(Error::Epub("empty spine"));
         }
 
-        let mut epub = Epub { zip, title, author, spine, toc: Vec::new() };
+        let cover = find_cover(&manifest, cover_id.as_deref()).map(|m| resolve(&base, &m.href));
+        let mut epub = Epub { zip, title, author, spine, toc: Vec::new(), cover };
 
         // Prefer the EPUB 3 navigation document, fall back to the NCX.
         let nav = manifest
@@ -329,12 +366,28 @@ impl<F: ReadAt> Epub<F> {
         Ok(out)
     }
 
-    /// Loads and parses one spine item into styled text blocks.
+    /// The cover picture's file, if the book has one.
+    pub fn read_cover(&mut self) -> Option<Vec<u8>> {
+        let path = self.cover.clone()?;
+        self.read(&path).ok()
+    }
+
+    /// A file in the book, such as a picture.
+    pub fn read(&mut self, path: &str) -> Result<Vec<u8>, Error> {
+        self.zip.read(path)
+    }
+
+    /// Loads and parses one spine item into styled text blocks and pictures.
     pub fn chapter(&mut self, index: usize) -> Result<Chapter, Error> {
         let item = self.spine.get(index).ok_or(Error::Epub("chapter out of range"))?;
         let path = item.path.clone();
         let doc = utf8(self.zip.read(&path)?);
-        Ok(text::parse_xhtml(&doc))
+        let zip = &mut self.zip;
+        Ok(text::parse_xhtml(&doc, |src| {
+            let path = resolve(dir_of(&path), src);
+            let (width, height) = picture_size(zip, &path)?;
+            Some(Image { path, width, height, caption: 0 })
+        }))
     }
 
     /// Title of the TOC entry that covers `spine`, if any.

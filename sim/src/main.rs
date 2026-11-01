@@ -5,9 +5,10 @@
 //! ```
 //!
 //! `--books` defaults to `testbooks/`; `--state` (the card's `/READER/`)
-//! defaults to `READER/` inside it. The screen is shown in the panel's 8 gray
-//! levels unless `--true-gray` is given. `--battery` pretends a charge level,
-//! as the device reports it.
+//! defaults to `READER/` inside it, and the sleep screen's pictures (the
+//! card's `/SLEEP/`) come from `SLEEP/` inside it. The screen is shown in the
+//! panel's 8 gray levels unless `--true-gray` is given. `--battery` pretends
+//! a charge level, as the device reports it.
 //!
 //! In a window: Right/Down/PageDown/Space = Next, Left/Up/PageUp = Prev,
 //! Enter = Menu, Escape/Backspace = Back.
@@ -72,6 +73,25 @@ impl Storage for DirStorage {
     fn save(&mut self, name: &str, data: &[u8]) -> Result<(), Error> {
         fs::create_dir_all(&self.state).map_err(|_| Error::Io)?;
         fs::write(self.state.join(name), data).map_err(|_| Error::Io)
+    }
+
+    fn list_pictures(&mut self) -> Vec<String> {
+        let picture = |p: &Path| {
+            p.extension().and_then(|x| x.to_str()).is_some_and(|x| ["jpg", "jpeg", "png"].contains(&x.to_ascii_lowercase().as_str()))
+        };
+        let mut out: Vec<_> = fs::read_dir(self.books.join("SLEEP"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| picture(&e.path()))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn load_picture(&mut self, name: &str) -> Option<Vec<u8>> {
+        fs::read(self.books.join("SLEEP").join(name)).ok()
     }
 }
 
@@ -141,6 +161,7 @@ fn main() {
                 'm' => Input::Menu,
                 'b' => Input::Back,
                 'z' => {
+                    let t = std::time::Instant::now();
                     match app.sleep_screen() {
                         Some(screen) => app.draw_sleep(&mut canvas, screen),
                         None => {
@@ -148,6 +169,7 @@ fn main() {
                             app.draw(&mut canvas);
                         }
                     }
+                    eprintln!("sleep screen drawn in {} ms", t.elapsed().as_millis());
                     write_png(&canvas, &out.join(format!("{:03}.png", i + 1)), true_gray);
                     continue;
                 }

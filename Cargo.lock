@@ -251,7 +251,9 @@ name = "inkreader-core"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "libm",
  "miniz_oxide 0.8.9",
+ "png",
 ]
 
 [[package]]

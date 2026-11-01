@@ -8,7 +8,10 @@ extern crate std;
 
 pub mod epub;
 pub mod fonts;
+pub mod image;
+mod jpeg;
 pub mod layout;
+mod png;
 pub mod render;
 pub mod settings;
 pub mod text;
@@ -21,6 +24,7 @@ pub enum Error {
     Io,
     Zip(&'static str),
     Epub(&'static str),
+    Image(&'static str),
 }
 
 /// Random-access read of a file (an SD card file on the device, a `std::fs::File` on a PC).
