@@ -119,6 +119,7 @@ fn main() {
     }
     let state = state.unwrap_or_else(|| books.join("READER"));
     let mut app = App::new(DirStorage { books, state });
+    app.system = vec![("Device".into(), "Simulator".into())];
     app.start();
     let mut canvas = Canvas::new(WIDTH, HEIGHT);
 

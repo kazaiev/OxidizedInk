@@ -1,8 +1,9 @@
 //! The reader's screens and navigation, driven by four abstract inputs.
 //!
 //! Screens: the library (books on the card), the reading view, a menu over
-//! the page, the table of contents and the settings. All state that must
-//! survive sleep or power-off goes through `Storage` as small text files.
+//! the page, the table of contents, the settings and system info. All state
+//! that must survive sleep or power-off goes through `Storage` as small text
+//! files.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -70,10 +71,11 @@ enum Screen {
     Toc { sel: usize },
     /// `from_reading`: opened from the reading menu rather than the library.
     Settings { sel: usize, from_reading: bool },
+    System { from_reading: bool },
     Message(String),
 }
 
-const MENU: [&str; 6] = ["Back to book", "Contents", "Larger text", "Smaller text", "Settings", "Library"];
+const MENU: [&str; 7] = ["Back to book", "Contents", "Larger text", "Smaller text", "Settings", "System info", "Library"];
 
 /// Where to land when entering a chapter.
 #[derive(Clone, Copy)]
@@ -257,6 +259,8 @@ pub struct App<S: Storage> {
     reader: Option<Reader<S::Book>>,
     /// Battery charge in percent, shown in the menu when known.
     pub battery: Option<u8>,
+    /// `(label, value)` rows for the System info screen, from the platform.
+    pub system: Vec<(String, String)>,
 }
 
 impl<S: Storage> App<S> {
@@ -270,6 +274,7 @@ impl<S: Storage> App<S> {
             library: Vec::new(),
             reader: None,
             battery: None,
+            system: Vec::new(),
         }
     }
 
@@ -458,7 +463,8 @@ impl<S: Storage> App<S> {
                             self.screen = Screen::Reading;
                         }
                         4 => self.screen = Screen::Settings { sel: 0, from_reading: true },
-                        5 => return self.show_library(),
+                        5 => self.screen = Screen::System { from_reading: true },
+                        6 => return self.show_library(),
                         _ => self.screen = Screen::Reading,
                     },
                 }
@@ -492,13 +498,16 @@ impl<S: Storage> App<S> {
                 true
             }
             Screen::Library { sel } => {
-                // The books, then a row for the settings.
-                let n = self.library.len() + 1;
+                // The books, then rows for the settings and system info.
+                let n = self.library.len() + 2;
                 match input {
                     Input::Prev => self.screen = Screen::Library { sel: (sel + n - 1) % n },
                     Input::Next => self.screen = Screen::Library { sel: (sel + 1) % n },
                     Input::Menu if sel < self.library.len() => self.open_book(sel),
-                    Input::Menu => self.screen = Screen::Settings { sel: 0, from_reading: false },
+                    Input::Menu if sel == self.library.len() => {
+                        self.screen = Screen::Settings { sel: 0, from_reading: false }
+                    }
+                    Input::Menu => self.screen = Screen::System { from_reading: false },
                     Input::Back if self.reader.is_some() => self.screen = Screen::Reading,
                     _ => return false,
                 }
@@ -521,6 +530,18 @@ impl<S: Storage> App<S> {
                             Screen::Library { sel: self.library.len() }
                         };
                     }
+                }
+                true
+            }
+            Screen::System { from_reading } => {
+                // Other inputs just redraw: the platform updates the rows
+                // before each one.
+                if input == Input::Back {
+                    self.screen = if from_reading && self.reader.is_some() {
+                        Screen::Reading
+                    } else {
+                        Screen::Library { sel: self.library.len() + 1 }
+                    };
                 }
                 true
             }
@@ -568,6 +589,7 @@ impl<S: Storage> App<S> {
             Screen::Toc { sel } => self.draw_toc(canvas, sel),
             Screen::Library { sel } => self.draw_library(canvas, sel),
             Screen::Settings { sel, .. } => self.draw_settings(canvas, sel),
+            Screen::System { .. } => self.draw_system(canvas),
             Screen::Message(m) => {
                 let x = (WIDTH - self.width(0, 24, &m)) / 2;
                 self.text(canvas, 0, 24, x, HEIGHT / 2, &m);
@@ -672,30 +694,50 @@ impl<S: Storage> App<S> {
     fn draw_library(&mut self, canvas: &mut Canvas, sel: usize) {
         let mut rows: Vec<_> = self.library.iter().map(|b| (b.title.clone(), b.author.clone(), 0)).collect();
         rows.push((String::from("Settings"), String::from("Text, layout, buttons and sleep"), 0));
+        rows.push((String::from("System info"), String::from("Battery, card and memory"), 0));
         self.draw_list(canvas, "Library", &rows, sel, true);
         if self.library.is_empty() {
-            self.text(canvas, 0, 22, MARGIN_X, 220, "No books found.");
-            self.text(canvas, ITALIC, 18, MARGIN_X, 256, "Copy .epub files to the SD card.");
+            self.text(canvas, 0, 22, MARGIN_X, 292, "No books found.");
+            self.text(canvas, ITALIC, 18, MARGIN_X, 328, "Copy .epub files to the SD card.");
         }
     }
 
     fn draw_settings(&mut self, canvas: &mut Canvas, sel: usize) {
         self.draw_header(canvas, "Settings");
         let (top, row_h) = (88, 48);
-        let (left, right) = (MARGIN_X + 12, WIDTH - MARGIN_X - 12);
+        let left = MARGIN_X + 12;
         for (i, s) in SETTINGS.iter().enumerate() {
             let y = top + i as i32 * row_h;
-            self.text(canvas, 0, 22, left, y + 32, s.label);
-            let value = self.settings.label(i);
-            let w = self.width(BOLD, 22, value);
-            self.text(canvas, BOLD, 22, right - w, y + 32, value);
+            self.draw_pair(canvas, y, s.label, self.settings.label(i));
             if i == sel {
                 canvas.invert_rect(MARGIN_X, y + 2, WIDTH - 2 * MARGIN_X, row_h - 4);
             }
         }
         let y = top + SETTINGS.len() as i32 * row_h + 40;
         self.text(canvas, ITALIC, 18, left, y, SETTINGS[sel].help);
-        let hint = "Menu: change    Hold Menu: back";
+        self.draw_hint(canvas, "Menu: change    Hold Menu: back");
+    }
+
+    fn draw_system(&mut self, canvas: &mut Canvas) {
+        self.draw_header(canvas, "System info");
+        let mut rows = self.system.clone();
+        rows.push((String::from("Books"), self.library.len().to_string()));
+        for (i, (label, value)) in rows.iter().enumerate() {
+            self.draw_pair(canvas, 88 + i as i32 * 48, label, value);
+        }
+        self.draw_hint(canvas, "Any button: update    Hold Menu: back");
+    }
+
+    /// A row of a 48-pixel list starting at `y`: label left, value right.
+    fn draw_pair(&mut self, canvas: &mut Canvas, y: i32, label: &str, value: &str) {
+        let (left, right) = (MARGIN_X + 12, WIDTH - MARGIN_X - 12);
+        self.text(canvas, 0, 22, left, y + 32, label);
+        let w = self.width(BOLD, 22, value);
+        self.text(canvas, BOLD, 22, right - w, y + 32, value);
+    }
+
+    /// A centred line of help at the bottom of the screen.
+    fn draw_hint(&mut self, canvas: &mut Canvas, hint: &str) {
         let w = self.width(0, STATUS_PX, hint);
         self.text(canvas, 0, STATUS_PX, (WIDTH - w) / 2, STATUS_BASELINE, hint);
     }

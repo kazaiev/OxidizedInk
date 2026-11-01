@@ -17,6 +17,11 @@ use crate::panel::Bus;
 
 const SAMPLES: u32 = 16;
 
+/// Gain correction for this board's divider and ADC, as (true, model) mV.
+/// On 2026-10-22, on USB, a meter read 4.18 V at the cell and the model 4242.
+/// One point only corrects gain; check again near 3.7 V for any offset.
+const CAL: (u32, u32) = (4180, 4242);
+
 pub struct Battery {
     adc: Adc<'static, ADC1<'static>, Blocking>,
     pin: AdcPin<GPIO35<'static>, ADC1<'static>>,
@@ -48,7 +53,7 @@ impl Battery {
         // At 11 dB: mV = raw * vref * 196602 / 4096 / 65536 + 142, rounded.
         let coeff_a = self.vref * 196_602 / 4096;
         let pin_mv = (coeff_a * raw + 32_768) / 65_536 + 142;
-        Some(Reading { mv: 2 * pin_mv, raw })
+        Some(Reading { mv: 2 * pin_mv * CAL.0 / CAL.1, raw })
     }
 }
 

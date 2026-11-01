@@ -21,9 +21,12 @@ mod panel;
 mod sd;
 mod storage;
 
+use alloc::format;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use esp_alloc::{MemoryCapability, HEAP};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
@@ -129,13 +132,29 @@ fn wait_input(button: &gpio::Input, idle: Duration) -> Option<Input> {
     }
 }
 
-/// Reads the battery, logs it, and hands the charge level to the app.
-fn update_battery<S: Storage>(battery: &mut Battery, bus: &mut Bus, app: &mut App<S>) {
-    if let Some(r) = battery.read(bus) {
-        let pct = battery::percent(r.mv);
-        info!("battery: {} mV (raw {}), {}%", r.mv, r.raw, pct);
-        app.battery = Some(pct);
+/// Reads the battery, logs it, and refreshes what the app shows about the
+/// device: the charge in the menu and the rows of System info.
+fn update_status<S: Storage>(battery: &mut Battery, bus: &mut Bus, app: &mut App<S>, card_mb: u64) {
+    let row = |label: &str, value: String| (String::from(label), value);
+    app.system.clear();
+    match battery.read(bus) {
+        Some(r) => {
+            let pct = battery::percent(r.mv);
+            info!("battery: {} mV (raw {}), {}%", r.mv, r.raw, pct);
+            app.battery = Some(pct);
+            app.system.push(row("Battery", format!("{} mV, {}%", r.mv, pct)));
+            app.system.push(row("Battery ADC", format!("raw {}, ref {} mV", r.raw, battery.vref)));
+        }
+        None => {
+            app.battery = None;
+            app.system.push(row("Battery", String::from("can't read")));
+        }
     }
+    app.system.push(row("SD card", format!("{} MB", card_mb)));
+    let internal = HEAP.free_caps(MemoryCapability::Internal.into());
+    let psram = HEAP.free() - internal;
+    app.system.push(row("Free memory", format!("{} KB + {} KB PSRAM", internal / 1024, psram / 1024)));
+    app.system.push(row("Firmware", String::from(env!("CARGO_PKG_VERSION"))));
 }
 
 /// Expander 1 into a safe state. VCOM and PWRUP go low before WAKEUP, as in
@@ -216,9 +235,10 @@ fn main() -> ! {
 
     match card {
         Some(sd) => {
-            info!("SD card: {} MB", sd.size / 1_000_000);
+            let card_mb = sd.size / 1_000_000;
+            info!("SD card: {} MB", card_mb);
             let mut app = App::new(CardStorage::new(sd));
-            update_battery(&mut battery, &mut bus, &mut app);
+            update_status(&mut battery, &mut bus, &mut app, card_mb);
             app.start();
             info!("reader started in {} ms", boot.elapsed().as_millis());
             // After a wake the panel still shows what `settle` left there,
@@ -230,7 +250,7 @@ fn main() -> ! {
                 let idle = Duration::from_secs(app.settings().sleep_minutes() as u64 * 60);
                 let Some(input) = wait_input(&button, idle) else { break };
                 info!("button: {:?}", input);
-                update_battery(&mut battery, &mut bus, &mut app);
+                update_status(&mut battery, &mut bus, &mut app, card_mb);
                 if app.handle(input) {
                     screen.show_app(&mut app, &mut bus);
                 }
