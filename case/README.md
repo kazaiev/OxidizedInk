@@ -1,17 +1,39 @@
 # Case
 
 A 3D-printed case for the Inkplate 6 V2 (the purple Soldered board) with a
-606090 LiPo cell and three page buttons. It measures about 150 × 134 ×
+606090 LiPo cell and three page buttons. It measures about 150 × 123 ×
 15.4 mm. Held upright with USB-C at the bottom, the buttons are on the right
 of the screen: Menu at the top, then Prev and Next.
 
 Everything is in `oxidized-ink-case.scad` (OpenSCAD 2021 or newer). The
-values at the top are the ones to change. `./build.sh` exports the printable
-parts to `stl/`.
+values at the top are the ones to change. The printable parts are in `stl/`,
+ready for a slicer. After changing the source, run `./build.sh` to export
+them again.
 
 ## Before printing the whole case
 
-This was fitted to my purple board, check yours!
+Several sizes come from the board's design files or from Soldered's own case,
+not from a real board. They are marked `check` in the source. Measure these
+and update the source:
+
+| Value | What to measure | Default |
+|---|---|---|
+| `panel_t` | Board plus screen at the edge, minus 1.6 | 1.3 |
+| `standoff_h` | Height of the brass standoffs on the back | 7 |
+| `cell` | The cell's thickness, and its length with the protection board | 6, 94 |
+| `parts_h` | The reset button in the middle of the board (it ends up under the cell) | 2.0 |
+| `sw`, `sw_h`, `leg_pitch` | Switch body, height to the plunger tip, leg spacing | 6, 5, 6.5 × 4.5 |
+| `side_sw_tip` | How far the power and wake buttons reach past the board edge (edge = 72.2) | 72.4 |
+
+Then print the two fit tests, which take far less time and plastic than the
+case:
+
+- `fit_window`: only the front plate and the ledge. Lay the board in screen
+  down. The board's edge should rest on the ledge, and the screen's active
+  area should sit evenly inside the window. If it's off, move `window_c`.
+- `fit_ports`: both end walls. Hold each against its end of the board and
+  check that USB-C plugs in, that the SD card goes in, and that the power and
+  wake holes line up with the side buttons.
 
 ## Parts
 
@@ -35,8 +57,9 @@ The last five cut their own thread in 2.5 mm holes.
 
 ## Assembly
 
-1. Press each switch into the bar with its legs through the notches. Bend the
-   legs flat on the back and solder the wires to them. Use two diagonal legs
+1. Press each switch into the bar with its legs through the notches. The legs
+   point along the bar; the notches only fit that way round. Bend the legs
+   flat on the back and solder the wires to them. Use two diagonal legs
    of each switch, or check with a meter, because the legs are joined in
    pairs.
 2. Wire the switches to the "GPIO EXPANDER 1" row. Hole 1 is GND, shared by

@@ -1,4 +1,4 @@
-// OxidizedInk: a case for the Inkplate 6 V2 (Soldered, purple board) with a
+// oxidized-ink: a case for the Inkplate 6 V2 (Soldered, purple board) with a
 // 606090 cell and three page buttons on a strip beside the screen.
 //
 // Frame: X and Y are the board's KiCad coordinates relative to its centre
@@ -52,7 +52,7 @@ parts_h = 2.0;                 // check: tallest part over the cell (reset butto
 gap = 0.4;                     // board to wall
 wall = 2.4;
 wall_far = 3.0;                // the +Y wall carries a screw boss
-strip_w = 20;                  // button strip, inside
+strip_w = 9;                   // button strip, inside: just room for the bar
 corner_r = 4;
 t_back = 1.8;
 t_front = 1.6;
@@ -65,13 +65,13 @@ leg_pitch = [6.5, 4.5];        // check
 pocket_depth = 3.0;
 bar_floor = 2.0;
 btn_x = [12, -12, 45];         // Prev, Next, Menu
-caps = [[15, 7.5], [15, 7.5], [8, 8]];  // [length along X, width]
+caps = [[15, 6], [15, 6], [6, 6]];  // [length along X, width]
 cap_up = 0.8;                  // how far a cap stands proud of the front
 cap_clear = 0.25;
 lip = 1.0;
 flange_t = 1.0;
 bar_x = [-24, 54];
-bar_w = 12;
+bar_w = strip_w - 0.6;
 bar_posts = [0, 30];
 post_d = 5.5;
 
@@ -97,6 +97,7 @@ z_floor = z_tip - sw_h;
 z_bar_front = z_floor + pocket_depth;
 z_bar_back = z_floor - bar_floor;
 assert(z_bar_back > t_back + 1.5, "switches too tall for the case: shorten sw_h or thicken the case");
+assert(bar_w >= sw + 0.3 + 2, "strip too narrow for the switches: widen strip_w");
 
 // Outline
 cav_x = board[0] / 2 + gap;
@@ -146,6 +147,14 @@ module notch_boss_raw2d() {
     }
 }
 
+// The two screw bosses in the button strip, merged into the outer wall.
+module strip_bosses2d() {
+    for (p = [boss_pts[0], boss_pts[1]]) hull() {
+        translate(p) circle(d = 7);
+        translate([p[0] - 3.5, cav_y0 - 0.1]) square([7, 0.1]);
+    }
+}
+
 // A hole along X through an end wall, centred at (y, z).
 module xcut(x0, x1, y, z, w, h, r = 0.5) {
     translate([x0, y, z]) rotate([0, 90, 0])
@@ -168,8 +177,7 @@ module shell() {
             // The board's edge rests here, outside the screen, so the glass takes no load.
             translate([0, 0, zB]) linear_extrude(z_in - zB + 0.01)
                 difference() { intersection() { board2d(); cavity2d(); } panel2d(0.4); }
-            for (p = [boss_pts[0], boss_pts[1]]) translate([p[0], p[1], t_back]) cylinder(d = 7, h = z_in - t_back + 0.01);
-            translate([0, 0, t_back]) linear_extrude(z_in - t_back + 0.01) notch_boss2d();
+            translate([0, 0, t_back]) linear_extrude(z_in - t_back + 0.01) { strip_bosses2d(); notch_boss2d(); }
             for (x = bar_posts) translate([x, btn_y, z_bar_front]) cylinder(d = post_d, h = z_in - z_bar_front + 0.01);
         }
         translate([0, 0, z_in - 0.01]) linear_extrude(t_front + 0.02) window2d();
@@ -204,7 +212,7 @@ module back() {
             translate([0, 0, t_back]) linear_extrude(1.5) difference() {
                 offset(delta = -0.3) cavity2d();
                 offset(delta = -1.5) cavity2d();
-                offset(delta = 0.3) notch_boss2d();
+                offset(delta = 0.3) { strip_bosses2d(); notch_boss2d(); }
             }
             for (p = standoffs) translate([p[0], p[1], t_back]) cylinder(d = 7, h = zF - standoff_h - t_back);
             cell_corners();
@@ -233,9 +241,10 @@ module bar() {
         translate([bar_x[0], btn_y - bar_w / 2, z_bar_back]) cube([bar_x[1] - bar_x[0], bar_w, z_bar_front - z_bar_back]);
         for (x = btn_x) translate([x, btn_y, 0]) {
             translate([-pocket / 2, -pocket / 2, z_floor]) cube([pocket, pocket, 10]);
-            // Notches for the legs, for either way round.
-            for (p = [leg_pitch, [leg_pitch[1], leg_pitch[0]]], sx = [-1, 1], sy = [-1, 1])
-                translate([sx * p[0] / 2 - 0.8, sy * p[1] / 2 - 0.8, z_bar_back - 1]) cube([1.6, 1.6, 20]);
+            // Notches for the legs. The bar is too narrow for the wide leg
+            // spacing across it, so the legs point along the bar.
+            for (sx = [-1, 1], sy = [-1, 1])
+                translate([sx * leg_pitch[0] / 2 - 0.8, sy * leg_pitch[1] / 2 - 0.8, z_bar_back - 1]) cube([1.6, 1.6, 20]);
         }
         for (x = bar_posts) translate([x, btn_y, z_bar_back]) csk();
     }

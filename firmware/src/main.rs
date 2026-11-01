@@ -1,4 +1,4 @@
-//! OxidizedInk firmware for the Inkplate 6 V2.
+//! oxidized-ink firmware for the Inkplate 6 V2.
 //!
 //! Boot puts the board in a safe state, powers the SD card and starts the
 //! reader core, which reopens the last book at its saved page. Each button
@@ -15,6 +15,7 @@
 
 extern crate alloc;
 
+mod battery;
 mod expander;
 mod panel;
 mod sd;
@@ -38,6 +39,7 @@ use inkreader_core::render::{Canvas, Renderer};
 use inkreader_core::ui::{App, Input, Storage, HEIGHT, WIDTH};
 use log::{info, warn};
 
+use battery::Battery;
 use expander::{pin, Expander, EXP1, EXP2};
 use panel::{pack_portrait, Bus, Panel, FB_SIZE};
 use sd::Sd;
@@ -127,6 +129,15 @@ fn wait_input(button: &gpio::Input, idle: Duration) -> Option<Input> {
     }
 }
 
+/// Reads the battery, logs it, and hands the charge level to the app.
+fn update_battery<S: Storage>(battery: &mut Battery, bus: &mut Bus, app: &mut App<S>) {
+    if let Some(r) = battery.read(bus) {
+        let pct = battery::percent(r.mv);
+        info!("battery: {} mV (raw {}), {}%", r.mv, r.raw, pct);
+        app.battery = Some(pct);
+    }
+}
+
 /// Expander 1 into a safe state. VCOM and PWRUP go low before WAKEUP, as in
 /// the PMIC's power-down order, in case the last firmware left it on.
 fn safe_state(exp1: &mut Expander, i2c: &mut I2c<'_, Blocking>) -> Result<(), Error> {
@@ -189,6 +200,8 @@ fn main() -> ! {
         p.GPIO33.degrade(),
     ]);
     let mut button = gpio::Input::new(p.GPIO36, InputConfig::default());
+    let mut battery = Battery::new(p.ADC1, p.GPIO35);
+    info!("ADC reference: {} mV", battery.vref);
 
     let card = match bus.exp1.set_output(&mut bus.i2c, pin::SD_POWER, false) {
         Ok(()) => {
@@ -205,6 +218,7 @@ fn main() -> ! {
         Some(sd) => {
             info!("SD card: {} MB", sd.size / 1_000_000);
             let mut app = App::new(CardStorage::new(sd));
+            update_battery(&mut battery, &mut bus, &mut app);
             app.start();
             info!("reader started in {} ms", boot.elapsed().as_millis());
             // After a wake the panel still shows what `settle` left there,
@@ -216,6 +230,7 @@ fn main() -> ! {
                 let idle = Duration::from_secs(app.settings().sleep_minutes() as u64 * 60);
                 let Some(input) = wait_input(&button, idle) else { break };
                 info!("button: {:?}", input);
+                update_battery(&mut battery, &mut bus, &mut app);
                 if app.handle(input) {
                     screen.show_app(&mut app, &mut bus);
                 }

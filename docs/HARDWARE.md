@@ -1,26 +1,26 @@
 # Inkplate 6 hardware notes
 
-> **Disclaimer**: Gathered with the help from Claude Opus
-
-These notes are for writing a bare-metal panel driver. They were checked against these sources:
+These notes are for writing a bare-metal panel driver. They were checked
+against these sources:
 
 - **Soldered Arduino library:** master (11.2.0), 10.2.2, and legacy 8.0.0.
   8.0.0 is the last version that bit-bangs the panel over GPIO; later versions
   use I2S DMA.
 - **V2 KiCad design:** `SolderedElectronics/Soldered-Inkplate-6-hardware-design`
   CAD V1.2.1. The netlist was extracted and checked.
-- **V1 schematic:** `e-radionicacom/Inkplate-6-hardware` v1.0. 
+- **V1 schematic:** `e-radionicacom/Inkplate-6-hardware` v1.0. Its PDF text was
+  garbled, so treat V1 schematic facts as medium confidence.
 - **Datasheets:** TI TPS65186 (SLVSB04A) and NXP PCAL6416A (Rev 7.1).
 - **Docs:** docs.soldered.com pages on touchpads, free GPIO, and jumpers.
 
 > **License:** the Arduino library is LGPL-3.0 / GPL-3.0. A line-by-line port
-> of its driver code would be a derivative work. Register values, pin numbers and
+> of its driver code is a derivative work. Register values, pin numbers and
 > timing *facts* below are hardware documentation. Re-implement from these
-> facts.
+> facts, or license this repo compatibly; that choice is the owner's.
 
 ## Which board is this?
 
-My board has a **purple PCB with "Inkplate 6" on the back**. Per
+The user's board has a **purple PCB with "Inkplate 6" on the back**. Per
 Soldered, that makes it **Inkplate 6 V2** (the library calls it
 `ARDUINO_INKPLATE6V2`).
 
@@ -97,6 +97,32 @@ Pin numbering: 0–7 = port 0, 8–15 = port 1.
 Expander 2 is entirely free on both boards. On V2 its INT only goes to a
 header pad.
 
+**Where the free pins come out (V2, from the CAD V1.2.1 `.kicad_pcb`;
+V1.2.0 is identical).** They are on a row of 9 single plated holes
+(2.54 mm pitch) along one long edge. The silkscreen labels the row
+"GPIO EXPANDER 1", on the component (ESP32) side. From the end nearest the
+"GPIO EXPANDER 2" row:
+
+| Hole | Ref | Net |
+|---|---|---|
+| 1 | K54 | GND |
+| 2 | K51 | 3V3 |
+| 3 | K32 | P1-7 (pin 15) |
+| 4 | K31 | P1-6 (pin 14) |
+| 5 | K24 | P1-5 (pin 13) |
+| 6 | K23 | P1-4 (pin 12) |
+| 7 | K19 | P1-3 (pin 11) |
+| 8 | K33 | P1-2 (pin 10), only if JP3 is re-bridged |
+| 9 | K34 | P1-1 (pin 9), only if JP6 is re-bridged |
+
+Nothing else sits on the P1-3 to P1-7 nets: each runs straight from the
+expander pin to its hole. There is also a large GND pad (PAD3) along the same
+edge. Expander 1's INT (open-drain, 10k pull-up R45) reaches GPIO34 through
+JP2, which is bridged by default. Expander 1 runs from the same 3V3 rail as
+the ESP32: an LDO (TPS7A2633) whose enable is tied to VIN, so it stays
+powered in deep sleep. Earlier, unpublished V2 revisions may differ, so check
+the silkscreen first.
+
 ### PCAL6416A registers (V2)
 
 | Register | Port 0 / 1 | Notes |
@@ -118,6 +144,12 @@ How the library sets pins:
 - **Interrupt:** clear the INTMSK bit. INT fires on any change; the chip has
   no edge select.
 
+> **Library bug:** the library reads all registers with one sequential read
+> starting at 0x00. On the PCAL6416A, the address pointer only toggles within
+> a register pair, so the library's shadow copy starts out as garbage. Instead,
+> seed the shadow with the power-on defaults above, or read each pair
+> separately.
+
 ### MCP23017 registers (V1, BANK = 0)
 
 | Register | Port A / B |
@@ -133,7 +165,10 @@ How the library sets pins:
 | GPIO | 0x12 / 0x13 |
 | OLAT | 0x14 / 0x15 |
 
-### Init (V2)
+### Init (V2), cleaned up
+
+The library's own sequence has ordering bugs (see the notes below). The
+sequence to aim for:
 
 1. Seed the shadow registers with the power-on defaults.
 2. Make WAKEUP, PWRUP and VCOM outputs, driven LOW.
@@ -144,6 +179,13 @@ How the library sets pins:
    Set it back to INPUT (card off) before deep sleep.
 6. Panel pins OE, GMOD and SPV start as inputs (high-Z) until the panel is
    switched on.
+
+Library pitfalls to avoid:
+
+- Master's second init block drives pin 10 LOW right after setting it to
+  INPUT, which accidentally turns the SD card on.
+- On V1, master never sets pin 8, and it drives pin 10 (touchpad 1) as an
+  output.
 
 ## TPS65186 PMIC (I2C 0x48)
 
@@ -303,6 +345,21 @@ of each row holds:
   frames (V2; 5 on V1), then `clean(2,2)`, `clean(3,1)`, `vscan_start`. Do a
   full refresh every ~10 partials.
 
+## Buttons on the board (V2)
+
+From the CAD V1.2.1 netlist:
+
+| Switch | Where | What it does |
+|---|---|---|
+| SW1 | USB-C end, side-push | **Power toggle.** An MC14093 Schmitt-NAND flip-flop (U4, C27, R25) drives SW_OUT_D. That switches PMOS Q8 between SW_IN (battery or USB) and VIN, which feeds the LDO and the PMIC |
+| SW2 | Middle of the component side, top-push | **Reset.** It goes to MANUAL_RST of the TPS3840 supervisor (U6), which drives RST |
+| SW3 | Far end, side-push | **Wake.** GPIO36, active LOW |
+
+The board outline also has three cut-outs:
+- a notch for the ESP32 antenna at the USB end (x 60–66.7, y 69.4–87.4);
+- a notch in the far long edge (x 182.4–197.4, y 142.3–157);
+- a slot (x 185.9–194.9, y 120.8–140.8) where the panel FPC passes to K15.
+
 ## Wake sources and deep sleep
 
 | Source | Setup |
@@ -317,6 +374,30 @@ and turn the battery divider off.
 
 ## Battery
 
+V2 (CAD V1.2.1): one Li-ion/LiPo cell on K2, a 2-pin JST PH (2.0 mm) SMD
+socket with pin 1 = VBAT and pin 2 = GND. Hobby cells come wired both ways,
+so check polarity with a meter before plugging one in. The MCP73831 charger
+(U2) has R_PROG = 2.49k (R10), so it charges at about 1000 / 2.49 ≈ 400 mA
+(Soldered's docs say 500 mA). Use a cell of at least ~1000 mAh with its own
+protection circuit. The MCP73831 has no safety timer, so large cells are fine.
+
+Room for the cell: the component side has a 40 × 56 mm patch with no parts on
+it at x 104–144, y 52–108 in the `.kicad_pcb` coordinates. The board spans
+x 60–204.4 and y 49.2–157, with USB-C at the x = 60 end and the expander
+header rows along y = 50.7. K2 sits just below the patch, at x 108–116,
+y 120–129. Only vias and traces are there, so put insulating tape under the
+cell. That patch takes a 34 × 50 mm cell (LP603450 to LP103450).
+
+A larger flat cell, such as the user's 606090 (6 × 60 × 90 mm), can stand
+over x ~117–177, y ~55–151. That is right of K2, between the two header rows,
+and short of the coin-cell holder, the panel connector (K15) and easyC.
+Underneath are only low parts: passives, QFNs, the LQH44 and NR4012
+inductors, and the SW2 pushbutton. Their heights come from typical
+datasheets, not measured from the STEP file. Hold the cell off them with a
+shelf or the back cover, never resting on the parts.
+
+Reading the voltage:
+
 1. Enable the divider: pin 9 HIGH on V2, LOW on V1.
 2. Wait 5 ms.
 3. Read GPIO35 in millivolts at 11 dB attenuation (believed; not verified).
@@ -326,5 +407,6 @@ and turn the battery divider off.
 ## Not verified
 
 - I2C bus speed (believed to be 100 kHz) and the ADC attenuation default.
-- V1 jumper defaults and the V1 battery MOSFET circuit
+- V1 jumper defaults and the V1 battery MOSFET circuit, because of the
+  garbled PDF.
 - The I2S wire byte order, which only matters for a later I2S/DMA driver.
