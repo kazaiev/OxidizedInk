@@ -11,12 +11,13 @@ use esp_hal::Blocking;
 pub const EXP1: u8 = 0x20;
 pub const EXP2: u8 = 0x21;
 
-#[allow(dead_code)] // For the side buttons.
 const INPUT: u8 = 0x00;
 pub const OUTPUT: u8 = 0x02;
 pub const CONFIG: u8 = 0x06;
+const INLAT: u8 = 0x44;
 const PUPDEN: u8 = 0x46;
 const PUPDSEL: u8 = 0x48;
+const INTMSK: u8 = 0x4a;
 
 /// Expander 1 pins.
 pub mod pin {
@@ -30,7 +31,11 @@ pub mod pin {
     pub const BATTERY: u8 = 9;
     /// V2: LOW powers the microSD slot; an input turns it off.
     pub const SD_POWER: u8 = 10;
-    /// Free pins, planned for the side buttons.
+    /// The page buttons on the side of the case, each to ground.
+    pub const MENU: u8 = 11;
+    pub const PREV: u8 = 12;
+    pub const NEXT: u8 = 13;
+    /// Free pins, inputs with pull-ups: the page buttons and two spares.
     pub const FREE: [u8; 5] = [11, 12, 13, 14, 15];
 }
 
@@ -82,9 +87,20 @@ impl Expander {
     }
 
     /// Levels of all 16 pins. Reading also clears the interrupt line.
-    #[allow(dead_code)] // For the side buttons.
     pub fn inputs(&self, i2c: &mut I2c<'_, Blocking>) -> Result<u16, Error> {
         self.read(i2c, INPUT)
+    }
+
+    /// Lets a change on the pins in `mask`, and only those, pull INT low.
+    pub fn set_interrupts(&self, i2c: &mut I2c<'_, Blocking>, mask: u16) -> Result<(), Error> {
+        self.write(i2c, INTMSK, !mask)
+    }
+
+    /// Latches the pins in `mask`: the first change stays in the input
+    /// register, and INT stays low, until the inputs are read, even if the
+    /// pin has changed back by then.
+    pub fn set_latch(&self, i2c: &mut I2c<'_, Blocking>, mask: u16) -> Result<(), Error> {
+        self.write(i2c, INLAT, mask)
     }
 
     /// Drives a pin. The level is latched before the pin becomes an output,

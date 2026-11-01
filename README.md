@@ -6,9 +6,9 @@ SD card and read.
 
 **Status:** work in progress. The reader runs on the Inkplate 6 V2. It shows
 the library from the SD card, opens books, turns pages, saves progress and
-settings, and deep sleeps when idle. Until the side buttons are wired, the
-wake button does everything. A PC simulator runs the same code.
-
+settings, light-sleeps between page turns and deep sleeps when idle. Three
+buttons on the side of the case turn pages, open the menu and wake it. A PC
+simulator runs the same code. A 3D-printed case is in `case/`.
 See [OxidizedInk](
 https://alex.k4zka.online/projects/oxidized-ink/) for the full plan and status.
 
@@ -35,14 +35,20 @@ cargo build --release
 espflash flash --monitor target/xtensa-esp32-none-elf/release/inkreader
 ```
 
-Copy `.epub` files to the root of a FAT-formatted SD card. Until the side
-buttons are wired, the wake button does everything:
+Copy `.epub` files to the root of a FAT-formatted SD card. The three side
+buttons (wired as in `case/README.md`) are Menu, Prev and Next from the top;
+holding Menu for 0.6 s is Back. Any of them wakes the reader, and that press
+also acts. The board's own wake button is not used.
 
-| Press | Button |
-|---|---|
-| Short (under 0.6 s) | Next |
-| Long (0.6–2 s) | Menu |
-| Very long (over 2 s) | Back |
+Page turns and menu moves change only the pixels that differ, without the
+black and white flash; one screen update in ten (the "Full refresh" setting)
+is a full refresh that clears any ghosting.
+
+The status line shows the battery; its percentage changes with full
+refreshes. At 15% or below the reader sleeps behind a "Battery low" screen,
+and at 2% or below it shows "Battery empty" and won't open the book until
+it has been charged. To try those screens on a charged cell, build with
+`TEST_BATTERY=12 cargo build --release`.
 
 Progress and settings are saved in `/READER/` on the card.
 
@@ -68,8 +74,10 @@ cargo run --release -p inkreader-sim -- --books ~/books
 | Enter | Menu (also selects in lists) |
 | Escape, Backspace | Back (holding Menu on the device) |
 
-Settings are the last row of the library, and an item in the reading menu.
-Prev/Next pick a setting, Menu changes it, Back leaves. They are saved to
+Settings and System info are the last two rows of the library, and items in
+the reading menu. In Settings, Prev/Next pick a setting, Menu changes it, Back
+leaves. System info shows the battery voltage and charge, the card and free
+memory; any button reads them again, Back leaves. They are saved to
 `SETTINGS.TXT`, which can also be edited by hand:
 
 ```text
@@ -81,6 +89,7 @@ paragraphs = Indented
 status_line = Full
 page_buttons = Normal
 sleep = 5 min
+full_refresh = Every 10
 ```
 
 Reading state goes to `READER/` inside the books directory, like `/READER/`

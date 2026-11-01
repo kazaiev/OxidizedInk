@@ -1,19 +1,21 @@
 //! PC simulator: runs the reader core against a directory of books.
 //!
 //! ```text
-//! inkreader-sim [--books DIR] [--state DIR] [--true-gray] [--keys KEYS --out DIR]
+//! inkreader-sim [--books DIR] [--state DIR] [--true-gray] [--battery PERCENT] [--keys KEYS --out DIR]
 //! ```
 //!
 //! `--books` defaults to `testbooks/`; `--state` (the card's `/READER/`)
 //! defaults to `READER/` inside it. The screen is shown in the panel's 8 gray
-//! levels unless `--true-gray` is given.
+//! levels unless `--true-gray` is given. `--battery` pretends a charge level,
+//! as the device reports it.
 //!
 //! In a window: Right/Down/PageDown/Space = Next, Left/Up/PageUp = Prev,
 //! Enter = Menu, Escape/Backspace = Back.
 //!
 //! Headless, with `--keys`: presses each key in turn (`n` Next, `p` Prev,
-//! `m` Menu, `b` Back) and writes `000.png` for the first screen, then one
-//! PNG after each key, into `--out`.
+//! `m` Menu, `b` Back, `z` the screen the device would leave for its deep
+//! sleep) and writes `000.png` for the first screen, then one PNG after each
+//! key, into `--out`.
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek, SeekFrom};
@@ -95,7 +97,7 @@ fn write_png(canvas: &Canvas, path: &Path, true_gray: bool) {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: inkreader-sim [--books DIR] [--state DIR] [--true-gray] [--keys KEYS --out DIR]");
+    eprintln!("usage: inkreader-sim [--books DIR] [--state DIR] [--true-gray] [--battery PERCENT] [--keys KEYS --out DIR]");
     exit(2);
 }
 
@@ -105,6 +107,7 @@ fn main() {
     let mut keys = None;
     let mut out = None;
     let mut true_gray = false;
+    let mut battery = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut value = || args.next().unwrap_or_else(|| usage());
@@ -114,12 +117,15 @@ fn main() {
             "--keys" => keys = Some(value()),
             "--out" => out = Some(PathBuf::from(value())),
             "--true-gray" => true_gray = true,
+            "--battery" => battery = Some(value().parse().unwrap_or_else(|_| usage())),
             _ => usage(),
         }
     }
     let state = state.unwrap_or_else(|| books.join("READER"));
     let mut app = App::new(DirStorage { books, state });
     app.system = vec![("Device".into(), "Simulator".into())];
+    app.battery = battery;
+    app.status_battery = battery;
     app.start();
     let mut canvas = Canvas::new(WIDTH, HEIGHT);
 
@@ -134,6 +140,17 @@ fn main() {
                 'p' => Input::Prev,
                 'm' => Input::Menu,
                 'b' => Input::Back,
+                'z' => {
+                    match app.sleep_screen() {
+                        Some(screen) => app.draw_sleep(&mut canvas, screen),
+                        None => {
+                            app.settle();
+                            app.draw(&mut canvas);
+                        }
+                    }
+                    write_png(&canvas, &out.join(format!("{:03}.png", i + 1)), true_gray);
+                    continue;
+                }
                 _ => usage(),
             };
             app.handle(input);

@@ -33,6 +33,22 @@ const LAST_FILE: &str = "LAST.TXT";
 const SETTINGS_FILE: &str = "SETTINGS.TXT";
 const LIBRARY_FILE: &str = "LIBRARY.TXT";
 
+/// At or below this charge, in percent, the device sleeps behind a "Battery
+/// low" screen.
+pub const LOW_BATTERY: u8 = 15;
+/// At or below this charge (about 3.4 V) the reader stops: it shows
+/// "Battery empty" and sleeps until a press finds it charged.
+pub const EMPTY_BATTERY: u8 = 2;
+/// The status line's battery icon.
+const BATTERY_ICON: (i32, i32) = (24, 12);
+
+/// Full-screen pictures left on the panel while the device sleeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepScreen {
+    BatteryLow,
+    BatteryEmpty,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Input {
     Prev,
@@ -226,6 +242,21 @@ fn numbers(data: &[u8]) -> Vec<u64> {
         .collect()
 }
 
+/// A battery `w`×`h` with a nub on the right and walls `t` thick, filled to
+/// `percent`.
+fn draw_battery(canvas: &mut Canvas, x: i32, y: i32, (w, h): (i32, i32), t: i32, percent: u8) {
+    let nub = 2 * t;
+    let body = w - nub;
+    canvas.fill_rect(x, y, body, h, BLACK);
+    canvas.fill_rect(x + t, y + t, body - 2 * t, h - 2 * t, WHITE);
+    canvas.fill_rect(x + body, y + h / 4, nub, h - h / 2, BLACK);
+    // The charge, a wall's width inside the walls.
+    let fill = (body - 4 * t) * percent.min(100) as i32 / 100;
+    if fill > 0 {
+        canvas.fill_rect(x + 2 * t, y + 2 * t, fill.max(t), h - 4 * t, BLACK);
+    }
+}
+
 /// Shortens `s` with an ellipsis to fit `max` pixels.
 fn fit(fonts: &Fonts, face: u8, px: i32, s: &str, max: i32) -> String {
     let max = fonts.px_to_units(max, px);
@@ -257,8 +288,12 @@ pub struct App<S: Storage> {
     screen: Screen,
     library: Vec<BookInfo>,
     reader: Option<Reader<S::Book>>,
-    /// Battery charge in percent, shown in the menu when known.
+    /// Battery charge in percent, when known: the latest reading. The menu
+    /// shows it, and the low and empty battery checks use it.
     pub battery: Option<u8>,
+    /// The charge the status line shows. The device copies `battery` here
+    /// only before a full refresh, so partial refreshes never change it.
+    pub status_battery: Option<u8>,
     /// `(label, value)` rows for the System info screen, from the platform.
     pub system: Vec<(String, String)>,
 }
@@ -274,6 +309,7 @@ impl<S: Storage> App<S> {
             library: Vec::new(),
             reader: None,
             battery: None,
+            status_battery: None,
             system: Vec::new(),
         }
     }
@@ -552,6 +588,21 @@ impl<S: Storage> App<S> {
         }
     }
 
+    /// True when the battery is too low to keep reading.
+    pub fn battery_empty(&self) -> bool {
+        self.battery.is_some_and(|b| b <= EMPTY_BATTERY)
+    }
+
+    /// What to leave on the panel for a deep sleep: a sleep screen, or `None`
+    /// for the page (after `settle`).
+    pub fn sleep_screen(&self) -> Option<SleepScreen> {
+        match self.battery? {
+            b if b <= EMPTY_BATTERY => Some(SleepScreen::BatteryEmpty),
+            b if b <= LOW_BATTERY => Some(SleepScreen::BatteryLow),
+            _ => None,
+        }
+    }
+
     /// Leaves any menu or list for the reading view (the library if no book
     /// is open), as `start` would show it, e.g. before the device sleeps.
     /// Returns true if the screen changed.
@@ -590,11 +641,36 @@ impl<S: Storage> App<S> {
             Screen::Library { sel } => self.draw_library(canvas, sel),
             Screen::Settings { sel, .. } => self.draw_settings(canvas, sel),
             Screen::System { .. } => self.draw_system(canvas),
-            Screen::Message(m) => {
-                let x = (WIDTH - self.width(0, 24, &m)) / 2;
-                self.text(canvas, 0, 24, x, HEIGHT / 2, &m);
-            }
+            Screen::Message(m) => self.centered(canvas, 0, 24, HEIGHT / 2, &m),
         }
+    }
+
+    pub fn draw_sleep(&mut self, canvas: &mut Canvas, screen: SleepScreen) {
+        canvas.clear();
+        let (title, line, hint, level) = match screen {
+            SleepScreen::BatteryLow => (
+                "Battery low",
+                "Charge the reader soon.",
+                "Press a button to keep reading.",
+                self.battery.unwrap_or(LOW_BATTERY),
+            ),
+            SleepScreen::BatteryEmpty => (
+                "Battery empty",
+                "Charge the reader to keep reading.",
+                "Once it has charged, press a button.",
+                0,
+            ),
+        };
+        let size = (200, 96);
+        draw_battery(canvas, (WIDTH - size.0) / 2, 260, size, 8, level);
+        self.centered(canvas, BOLD, 32, 440, title);
+        self.centered(canvas, 0, 24, 488, line);
+        self.centered(canvas, ITALIC, 18, STATUS_BASELINE, hint);
+    }
+
+    fn centered(&mut self, canvas: &mut Canvas, face: u8, px: i32, y: i32, s: &str) {
+        let x = (WIDTH - self.width(face, px, s)) / 2;
+        self.text(canvas, face, px, x, y, s);
     }
 
     fn text(&mut self, canvas: &mut Canvas, face: u8, px: i32, x: i32, y: i32, s: &str) -> i32 {
@@ -619,12 +695,21 @@ impl<S: Storage> App<S> {
         let side = layout.left;
         let right = format!("{} / {}   {}%", r.page + 1, r.starts.len(), r.percent());
         let right_w = self.width(0, STATUS_PX, &right);
+        // The battery shows left of the page numbers, as an icon and percent.
+        let battery = self.status_battery;
+        let battery_text = battery.map(|b| format!("{}%", b));
+        let battery_w = battery_text.as_ref().map_or(0, |t| BATTERY_ICON.0 + 6 + self.width(0, STATUS_PX, t) + 20);
         let title = r.toc_index().map(|i| r.epub.toc[i].title.as_str()).unwrap_or(&r.info.title);
-        let title = fit(&self.fonts, ITALIC, STATUS_PX, title, WIDTH - 2 * side - right_w - 24);
+        let title = fit(&self.fonts, ITALIC, STATUS_PX, title, WIDTH - 2 * side - right_w - battery_w - 24);
         if status == StatusLine::Full {
             self.text(canvas, ITALIC, STATUS_PX, side, STATUS_BASELINE, &title);
         }
         self.text(canvas, 0, STATUS_PX, WIDTH - side - right_w, STATUS_BASELINE, &right);
+        if let (Some(b), Some(t)) = (battery, battery_text) {
+            let x = WIDTH - side - right_w - battery_w;
+            draw_battery(canvas, x, STATUS_BASELINE - 11, BATTERY_ICON, 1, b);
+            self.text(canvas, 0, STATUS_PX, x + BATTERY_ICON.0 + 6, STATUS_BASELINE, &t);
+        }
     }
 
     fn draw_menu(&mut self, canvas: &mut Canvas, sel: usize) {
@@ -738,7 +823,6 @@ impl<S: Storage> App<S> {
 
     /// A centred line of help at the bottom of the screen.
     fn draw_hint(&mut self, canvas: &mut Canvas, hint: &str) {
-        let w = self.width(0, STATUS_PX, hint);
-        self.text(canvas, 0, STATUS_PX, (WIDTH - w) / 2, STATUS_BASELINE, hint);
+        self.centered(canvas, 0, STATUS_PX, STATUS_BASELINE, hint);
     }
 }

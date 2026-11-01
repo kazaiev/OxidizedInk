@@ -63,7 +63,7 @@ The last five cut their own thread in 2.5 mm holes.
    of each switch, or check with a meter, because the legs are joined in
    pairs.
 2. Wire the switches to the "GPIO EXPANDER 1" row. Hole 1 is GND, shared by
-   all three. Hole 5 is Menu, hole 6 is Next, hole 7 is Prev. Solder from the
+   all three. Hole 5 is Next, hole 6 is Prev, hole 7 is Menu. Solder from the
    component side and trim the wires flush on the screen side; the ledge has a
    shallow groove there.
 3. Drop the caps into their holes from the inside. Screw the bar onto its two

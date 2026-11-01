@@ -39,7 +39,7 @@ use inkreader_core::text::{Chapter, BOLD, ITALIC};
 use log::{info, warn};
 
 use expander::{pin, Expander, EXP1, EXP2};
-use panel::{pack_portrait, Bus, Panel, FB_SIZE};
+use panel::{pack_portrait, Bus, Panel, Refresh, FB_SIZE};
 use sd::{Book, Entry, Sd};
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -363,7 +363,7 @@ fn main() -> ! {
         let t = Instant::now();
         pack_portrait(canvas, fb);
         let pack = ms(t);
-        match panel.show(bus, fb) {
+        match panel.show(bus, fb, Refresh::Full) {
             Ok(t) => info!(
                 "refresh: pack {} ms, power on {} ms, clean {} ms (77 frames), image {} ms (11 frames), power off {} ms",
                 pack, t.power_on, t.clean, t.frames, t.power_off

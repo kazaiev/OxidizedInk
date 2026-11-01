@@ -22,6 +22,7 @@ pub const PARAGRAPHS: usize = 4;
 pub const STATUS_LINE: usize = 5;
 pub const PAGE_BUTTONS: usize = 6;
 pub const SLEEP: usize = 7;
+pub const FULL_REFRESH: usize = 8;
 
 /// Values behind the options, in the same order.
 const FONT_SIZES: [i32; 8] = [18, 20, 22, 24, 26, 28, 32, 36];
@@ -29,8 +30,9 @@ const LINE_PCTS: [i32; 3] = [120, 140, 165];
 /// `(side, top)` margins in pixels.
 const MARGIN_PX: [(i32, i32); 3] = [(20, 20), (36, 28), (56, 40)];
 const SLEEP_MINUTES: [u32; 6] = [1, 2, 5, 10, 15, 30];
+const FULL_REFRESH_EVERY: [u32; 4] = [1, 5, 10, 20];
 
-pub const SETTINGS: [Setting; 8] = [
+pub const SETTINGS: [Setting; 9] = [
     Setting {
         key: "text_size",
         label: "Text size",
@@ -85,6 +87,13 @@ pub const SETTINGS: [Setting; 8] = [
         label: "Sleep after",
         help: "Idle time before sleep. Any button wakes the reader.",
         options: &["1 min", "2 min", "5 min", "10 min", "15 min", "30 min"],
+        default: 2,
+    },
+    Setting {
+        key: "full_refresh",
+        label: "Full refresh",
+        help: "How often the whole screen flashes to clear ghosting.",
+        options: &["Every page", "Every 5", "Every 10", "Every 20"],
         default: 2,
     },
 ];
@@ -196,6 +205,12 @@ impl Settings {
     pub fn sleep_minutes(&self) -> u32 {
         SLEEP_MINUTES[self.values[SLEEP] as usize]
     }
+
+    /// One screen update in this many is a full refresh; the others change
+    /// only the pixels that differ.
+    pub fn full_refresh_every(&self) -> u32 {
+        FULL_REFRESH_EVERY[self.values[FULL_REFRESH] as usize]
+    }
 }
 
 #[cfg(test)]
@@ -210,6 +225,7 @@ mod tests {
         assert_eq!(numbers(LINE_SPACING), LINE_PCTS.len());
         assert_eq!(numbers(MARGINS), MARGIN_PX.len());
         assert_eq!(numbers(SLEEP), SLEEP_MINUTES.len());
+        assert_eq!(numbers(FULL_REFRESH), FULL_REFRESH_EVERY.len());
         for (o, px) in SETTINGS[TEXT_SIZE].options.iter().zip(FONT_SIZES) {
             assert_eq!(*o, format!("{px}"));
         }

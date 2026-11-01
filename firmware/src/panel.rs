@@ -2,6 +2,11 @@
 //! the TPS65186 PMIC that powers it. Sequences, timing and the V2 waveform
 //! follow docs/HARDWARE.md.
 //!
+//! A full refresh cleans the whole panel (black and white flashes) and then
+//! draws the image in 3-bit gray. A partial refresh drives only the pixels
+//! that change: they fade to white, then get the same gray waveform, so the
+//! rest of the screen stays still.
+//!
 //! The panel must never be left powered: `show` always powers down, also on
 //! errors, and `emergency_off` does it from the panic handler.
 
@@ -63,6 +68,14 @@ const PRE_CLEAN: [(u8, u32); 9] = [
     (DISCHARGE, 1),
 ];
 
+/// Frames that fade a changed pixel to white before a partial refresh draws
+/// it. The library's 1-bit partial update flips black and white in 6.
+const FADE_FRAMES: usize = 6;
+
+/// A pixel code in the buffer for a partial refresh (see `diff`) that leaves
+/// the pixel alone.
+const UNCHANGED: u8 = 7;
+
 /// 3-bit grayscale waveform for V2: `[gray][frame]`, 0 = no-op, 1 = darken,
 /// 2 = lighten.
 const WAVEFORM: [[u8; 9]; 8] = [
@@ -113,6 +126,14 @@ impl From<Error> for PanelError {
     fn from(e: Error) -> Self {
         PanelError::I2c(e)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refresh {
+    /// `show` gets a framebuffer.
+    Full,
+    /// `show` gets the codes from `diff`.
+    Partial,
 }
 
 /// How long the parts of one refresh took, in milliseconds.
@@ -276,21 +297,15 @@ impl Panel {
         Ok(())
     }
 
-    /// One full 3-bit grayscale refresh of a powered panel.
-    fn draw(&self, bus: &mut Bus, fb: &[u8], timing: &mut Timing) -> Result<(), Error> {
-        let t = Instant::now();
-        for (byte, frames) in PRE_CLEAN {
-            self.clean(bus, byte, frames)?;
-        }
-        timing.clean = t.elapsed().as_millis();
-
-        let t = Instant::now();
-        for frame in 0..9 {
+    /// One frame per table: each maps a framebuffer nibble to the 2-bit code
+    /// that pixel gets in that frame.
+    fn frames(&self, bus: &mut Bus, fb: &[u8], tables: impl IntoIterator<Item = [u8; 16]>) -> Result<(), Error> {
+        for table in tables {
             // Two framebuffer pixels -> their two 2-bit codes for this frame,
             // odd x in bits 3:2, even x in bits 1:0.
             let mut codes = [0u8; 256];
             for (b, c) in codes.iter_mut().enumerate() {
-                *c = WAVEFORM[b & 7][frame] << 2 | WAVEFORM[b >> 4 & 7][frame];
+                *c = table[b & 15] << 2 | table[b >> 4];
             }
             self.vscan_start(bus)?;
             // Rows from y = 599 down, each from x = 799 down: walk the
@@ -308,27 +323,82 @@ impl Panel {
             }
             self.delay.delay_micros(230);
         }
+        Ok(())
+    }
+
+    /// One full 3-bit grayscale refresh of a powered panel.
+    fn draw(&self, bus: &mut Bus, fb: &[u8], timing: &mut Timing) -> Result<(), Error> {
+        let t = Instant::now();
+        for (byte, frames) in PRE_CLEAN {
+            self.clean(bus, byte, frames)?;
+        }
+        timing.clean = t.elapsed().as_millis();
+
+        let t = Instant::now();
+        let gray = (0..9).map(|k| core::array::from_fn(|n| WAVEFORM[n & 7][k]));
+        self.frames(bus, fb, gray)?;
         self.clean(bus, SKIP, 1)?;
         self.vscan_start(bus)?;
         timing.frames = t.elapsed().as_millis();
         Ok(())
     }
 
-    /// Powers the panel up, shows `fb` with a full refresh, and powers it
-    /// down again, whatever happened in between.
-    pub fn show(&mut self, bus: &mut Bus, fb: &[u8]) -> Result<Timing, PanelError> {
+    /// A partial refresh of a powered panel, from the codes of `diff`.
+    fn draw_partial(&self, bus: &mut Bus, codes: &[u8], timing: &mut Timing) -> Result<(), Error> {
+        let t = Instant::now();
+        let fade = (0..FADE_FRAMES).map(|_| core::array::from_fn(|n| if n & 8 != 0 { 2 } else { 0 }));
+        let gray = (0..9).map(|k| core::array::from_fn(|n| if n as u8 == UNCHANGED { 0 } else { WAVEFORM[n & 7][k] }));
+        self.frames(bus, codes, fade.chain(gray))?;
+        // As the library's partial update ends.
+        self.clean(bus, DISCHARGE, 2)?;
+        self.clean(bus, SKIP, 1)?;
+        self.vscan_start(bus)?;
+        timing.frames = t.elapsed().as_millis();
+        Ok(())
+    }
+
+    /// Powers the panel up, refreshes it, and powers it down again, whatever
+    /// happened in between. `fb` is a framebuffer for a full refresh, or the
+    /// codes from `diff` for a partial one.
+    pub fn show(&mut self, bus: &mut Bus, fb: &[u8], refresh: Refresh) -> Result<Timing, PanelError> {
         assert_eq!(fb.len(), FB_SIZE);
         let mut timing = Timing::default();
         let t = Instant::now();
         let result = self.power_on(bus).and_then(|()| {
             timing.power_on = t.elapsed().as_millis();
-            self.draw(bus, fb, &mut timing).map_err(PanelError::from)
+            let drawn = match refresh {
+                Refresh::Full => self.draw(bus, fb, &mut timing),
+                Refresh::Partial => self.draw_partial(bus, fb, &mut timing),
+            };
+            drawn.map_err(PanelError::from)
         });
         let t = Instant::now();
         self.power_off(bus);
         timing.power_off = t.elapsed().as_millis();
         result.map(|()| timing)
     }
+}
+
+/// Turns `shown`, the framebuffer on the panel, into the codes for a partial
+/// refresh to `next`, one nibble per pixel: `UNCHANGED`, or the new gray,
+/// plus 8 if the old gray isn't white and must fade first. A changed pixel
+/// never gets `UNCHANGED`: white to white is no change. Returns how many
+/// pixels change.
+pub fn diff(shown: &mut [u8], next: &[u8]) -> usize {
+    fn code(old: u8, new: u8) -> u8 {
+        match old {
+            _ if old == new => UNCHANGED,
+            7 => new,
+            _ => new | 8,
+        }
+    }
+    let mut changed = 0;
+    for (o, &n) in shown.iter_mut().zip(next) {
+        let (hi, lo) = (code(*o >> 4, n >> 4), code(*o & 15, n & 15));
+        changed += (hi != UNCHANGED) as usize + (lo != UNCHANGED) as usize;
+        *o = hi << 4 | lo;
+    }
+    changed
 }
 
 /// Packs a portrait canvas (600×800) into the panel's landscape framebuffer:
