@@ -32,6 +32,8 @@ pub struct Epub<F: ReadAt> {
     zip: Zip<F>,
     pub title: String,
     pub author: String,
+    /// `dc:language`, such as "en" or "en-US"; empty if the book doesn't say.
+    pub language: String,
     pub spine: Vec<SpineItem>,
     pub toc: Vec<TocEntry>,
     /// The cover picture's path inside the ZIP.
@@ -168,6 +170,7 @@ impl<F: ReadAt> Epub<F> {
 
         let mut title = String::new();
         let mut author = String::new();
+        let mut language = String::new();
         let mut manifest: Vec<ManifestItem> = Vec::new();
         let mut spine_ids: Vec<String> = Vec::new();
         let mut ncx_id: Option<String> = None;
@@ -184,6 +187,10 @@ impl<F: ReadAt> Epub<F> {
                     }
                     "creator" if author.is_empty() && !self_closing => {
                         capture = Some("creator");
+                        buf.clear();
+                    }
+                    "language" if language.is_empty() && !self_closing => {
+                        capture = Some("language");
                         buf.clear();
                     }
                     "item" => manifest.push(ManifestItem {
@@ -211,6 +218,7 @@ impl<F: ReadAt> Epub<F> {
                     if capture == Some(n) {
                         match n {
                             "title" => title = clean_text(&buf),
+                            "language" => language = clean_text(&buf),
                             _ => author = clean_text(&buf),
                         }
                         capture = None;
@@ -233,7 +241,7 @@ impl<F: ReadAt> Epub<F> {
         }
 
         let cover = find_cover(&manifest, cover_id.as_deref()).map(|m| resolve(&base, &m.href));
-        let mut epub = Epub { zip, title, author, spine, toc: Vec::new(), cover };
+        let mut epub = Epub { zip, title, author, language, spine, toc: Vec::new(), cover };
 
         // Prefer the EPUB 3 navigation document, fall back to the NCX.
         let nav = manifest

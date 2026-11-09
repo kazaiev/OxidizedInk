@@ -8,11 +8,13 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use core::ops::ControlFlow;
 
 use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_sdmmc::{
-    Directory, File, LfnBuffer, Mode, RawVolume, SdCard, ShortFileName, TimeSource, Timestamp, VolumeIdx, VolumeManager,
+    Block, BlockCount, BlockDevice, BlockIdx, Directory, File, LfnBuffer, Mode, RawVolume, SdCard, SdCardError,
+    ShortFileName, TimeSource, Timestamp, VolumeIdx, VolumeManager,
 };
 use embedded_sdmmc::filesystem::ToShortFileName;
 use esp_hal::delay::Delay;
@@ -25,7 +27,6 @@ use esp_hal::Blocking;
 use inkreader_core::{Error, ReadAt};
 
 type Device = ExclusiveDevice<Spi<'static, Blocking>, Output<'static>, Delay>;
-type Card = SdCard<Device, Delay>;
 type Volumes = VolumeManager<Card, Clock, 4, 4, 1>;
 pub type SdFile = File<'static, Card, Clock, 4, 4, 1>;
 
@@ -35,6 +36,137 @@ pub struct Clock;
 impl TimeSource for Clock {
     fn get_timestamp(&self) -> Timestamp {
         Timestamp::from_calendar(2026, 1, 1, 0, 0, 0).unwrap()
+    }
+}
+
+/// Changed blocks held back at most: 64 KB.
+const HELD: usize = 128;
+
+/// The card, with a write-back cache. embedded-sdmmc writes a file one
+/// 512-byte block at a time, and for each 2 KB cluster it reads and
+/// rewrites a block of the FAT; each single-block write takes the card
+/// about 6.5 ms, so uploads crawled at 80 KB/s. Changed blocks are held
+/// here instead, reads see them, and a block written again is replaced in
+/// place. When the cache is full, and on `Card::flush`, which every change
+/// to the card ends with, they go to the card in order, each run of
+/// neighbours as one multi-block write.
+struct Cached {
+    card: SdCard<Device, Delay>,
+    held: RefCell<Held>,
+    /// Reads, blocks read, writes, blocks written, µs reading, µs writing.
+    stats: RefCell<[u64; 6]>,
+}
+
+struct Held {
+    /// The block indices held, in the order first written.
+    index: Vec<u32>,
+    blocks: &'static mut [Block],
+    /// For gathering a run of neighbours into one write.
+    run: &'static mut [Block],
+}
+
+impl Cached {
+    fn flush(&self) -> Result<(), SdCardError> {
+        let mut held = self.held.borrow_mut();
+        let Held { index, blocks, run } = &mut *held;
+        if index.is_empty() {
+            return Ok(());
+        }
+        let mut order: Vec<usize> = (0..index.len()).collect();
+        order.sort_unstable_by_key(|&i| index[i]);
+        let t = esp_hal::time::Instant::now();
+        let mut result = Ok(());
+        let mut writes = 0;
+        let mut k = 0;
+        while k < order.len() {
+            let first = index[order[k]];
+            let mut n = 0;
+            while k + n < order.len() && index[order[k + n]] == first + n as u32 {
+                run[n].clone_from(&blocks[order[k + n]]);
+                n += 1;
+            }
+            writes += 1;
+            if let Err(e) = self.card.write(&run[..n], BlockIdx(first)) {
+                result = Err(e);
+                break;
+            }
+            k += n;
+        }
+        let mut s = self.stats.borrow_mut();
+        s[2] += writes;
+        s[3] += index.len() as u64;
+        s[5] += t.elapsed().as_micros();
+        index.clear();
+        result
+    }
+}
+
+/// The card as the filesystem sees it.
+#[derive(Clone, Copy)]
+pub struct Card(&'static Cached);
+
+impl Card {
+    /// Writes what is held back.
+    pub fn flush(&self) -> Result<(), SdError> {
+        self.0.flush().map_err(SdError::Card)
+    }
+
+    /// What the card did since the last call, for the log.
+    pub fn take_stats(&self) -> alloc::string::String {
+        let s = core::mem::take(&mut *self.0.stats.borrow_mut());
+        alloc::format!("{} reads ({} blocks, {} ms), {} writes ({} blocks, {} ms)", s[0], s[1], s[4] / 1000, s[2], s[3], s[5] / 1000)
+    }
+}
+
+impl BlockDevice for Card {
+    type Error = SdCardError;
+
+    fn read(&self, blocks: &mut [Block], start: BlockIdx) -> Result<(), SdCardError> {
+        let t = esp_hal::time::Instant::now();
+        let held = self.0.held.borrow();
+        let find = |b: u32| held.index.iter().position(|&i| i == b);
+        let span = start.0..start.0 + blocks.len() as u32;
+        if !span.clone().any(|b| find(b).is_some()) {
+            self.0.card.read(blocks, start)?;
+        } else {
+            for (block, b) in blocks.iter_mut().zip(span) {
+                match find(b) {
+                    Some(i) => block.clone_from(&held.blocks[i]),
+                    None => self.0.card.read(core::slice::from_mut(block), BlockIdx(b))?,
+                }
+            }
+        }
+        let mut s = self.0.stats.borrow_mut();
+        s[0] += 1;
+        s[1] += blocks.len() as u64;
+        s[4] += t.elapsed().as_micros();
+        Ok(())
+    }
+
+    fn write(&self, blocks: &[Block], start: BlockIdx) -> Result<(), SdCardError> {
+        for (block, b) in blocks.iter().zip(start.0..) {
+            let full = {
+                let held = self.0.held.borrow();
+                !held.index.contains(&b) && held.index.len() == HELD
+            };
+            if full {
+                self.0.flush()?;
+            }
+            let mut held = self.0.held.borrow_mut();
+            let Held { index, blocks: kept, .. } = &mut *held;
+            match index.iter().position(|&i| i == b) {
+                Some(i) => kept[i].clone_from(block),
+                None => {
+                    kept[index.len()].clone_from(block);
+                    index.push(b);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn num_blocks(&self) -> Result<BlockCount, SdCardError> {
+        self.0.card.num_blocks()
     }
 }
 
@@ -61,6 +193,7 @@ pub struct Sd {
     volume: RawVolume,
     /// Card size in bytes.
     pub size: u64,
+    card: Card,
 }
 
 /// The inner errors are only read through `Debug`, in the logs.
@@ -91,9 +224,19 @@ impl Sd {
         let size = card.num_bytes().map_err(SdError::Card)?;
         card.spi(|d| d.bus_mut().apply_config(&slow.with_frequency(Rate::from_mhz(20))))
             .map_err(|_| SdError::Spi)?;
+        let cached = alloc::boxed::Box::leak(alloc::boxed::Box::new(Cached {
+            card,
+            held: RefCell::new(Held {
+                index: Vec::with_capacity(HELD),
+                blocks: crate::psram::slice(HELD, Block::new),
+                run: crate::psram::slice(HELD, Block::new),
+            }),
+            stats: RefCell::new([0; 6]),
+        }));
+        let card = Card(cached);
         let volumes: &'static Volumes = alloc::boxed::Box::leak(alloc::boxed::Box::new(VolumeManager::new_with_limits(card, Clock, 5000)));
         let volume = volumes.open_volume(VolumeIdx(0))?.to_raw_volume();
-        Ok(Sd { volumes, volume, size })
+        Ok(Sd { volumes, volume, size, card })
     }
 
     /// A directory (`""` for the root). Closed again when dropped.
@@ -151,13 +294,30 @@ impl Sd {
         }
         let file = dir.open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)?;
         file.write(data)?;
-        file.flush()?;
-        Ok(())
+        file.close()?;
+        self.card.flush()
     }
 
     /// Opens a file in a directory (`""` for the root) by its 8.3 name.
     pub fn open(&self, path: &str, name: &ShortFileName) -> Result<SdFile, SdError> {
         Ok(self.dir(path)?.open_file_in_dir(name, Mode::ReadOnly)?)
+    }
+
+    /// Makes a new, empty file in a directory (`""` for the root), open for
+    /// writing. Fails if the name is taken. What is written is held back
+    /// until `Card::flush`, after closing it.
+    pub fn create(&self, path: &str, name: &str) -> Result<(SdFile, Card), SdError> {
+        Ok((self.dir(path)?.open_file_in_dir(name, Mode::ReadWriteCreate)?, self.card))
+    }
+
+    /// Deletes a file in a directory (`""` for the root). embedded-sdmmc
+    /// only marks the entry deleted and leaves the file's clusters in use,
+    /// so the file is emptied first, which frees all but its first cluster.
+    pub fn delete<N: ToShortFileName + Copy>(&self, path: &str, name: N) -> Result<(), SdError> {
+        let dir = self.dir(path)?;
+        dir.open_file_in_dir(name, Mode::ReadWriteTruncate)?.close()?;
+        dir.delete_entry_in_dir(name)?;
+        self.card.flush()
     }
 }
 

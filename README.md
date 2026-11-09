@@ -4,18 +4,14 @@ An EPUB e-book reader for the Soldered **Inkplate 6**, written in Rust.
 Books are parsed and laid out on the device itself. Copy `.epub` files to the
 SD card and read.
 
-**Status:** work in progress. 
-- The reader runs on the Inkplate 6 V2. 
-- It shows the library from the SD card with each book's cover.
-- Opens books (pictures included), turns pages, saves progress and settings.
-- Light-sleeps between page turns and deep sleeps when idle.
-- Book cover or a picture of your choice for sleep screen.
-- Three buttons on the side of the case turn pages, open the menu and wake it.
-- A PC simulator runs the same code.
-- A 3D-printed case is in `case/`.
-
-See [OxidizedInk](
-https://alex.k4zka.online/projects/oxidized-ink/) for the full plan and status.
+**Status:** work in progress. The reader runs on the Inkplate 6 V2. It shows
+the library from the SD card with each book's cover, opens books
+(pictures included), turns pages, saves progress and settings,
+light-sleeps between page turns and deep sleeps when idle, behind the
+book's cover or a picture of your choice.
+Three buttons on the side of the case turn pages, open the menu and wake
+it. A PC simulator runs the same code. A 3D-printed case is in `case/`; the
+fit prints fit. See [HANDOFF.md](HANDOFF.md) for the full plan and status.
 
 ## Layout
 
@@ -80,6 +76,25 @@ shows each book's cover, title, author and how much of it you've read. The
 first time a cover is shown it is shrunk from the book and saved there as a
 `.THM` file, which takes a moment; after that the library opens quickly.
 
+**Wi-Fi transfer** sends books to the reader from a browser. Once, put a
+`WIFI.TXT` in `/READER/` on the card naming a 2.4 GHz network (WPA2 or
+open):
+
+```text
+ssid = My network
+password = its password
+```
+
+Then pick **Wi-Fi transfer** in the library. The reader restarts into Wi-Fi
+mode, joins the network and shows an address such as
+`http://192.168.1.23/`. Open it on a computer or phone on the same network:
+drop `.epub` files on the page to send them (about 300 KB/s), click a title
+to download a book, or delete one. Holding Menu, or the "Sleep after" time
+without use, restarts it into the library. Books sent this way get short
+names on the card (`PRIDEAND.EPU`), as the SD library can't make long ones;
+the library shows their titles. `TEST_WIFI=1 cargo build --release` starts
+Wi-Fi transfer on power-on, to try it without the buttons.
+
 ## Testing
 
 Put some `.epub` files in `testbooks/` (it's gitignored), then run:
@@ -107,8 +122,8 @@ cargo run --release -p inkreader-sim -- --books ~/books
 | Enter | Menu (also selects in lists) |
 | Escape, Backspace | Back (holding Menu on the device) |
 
-Settings and System info are the last two rows of the library, and items in
-the reading menu. In Settings, Prev/Next pick a setting, Menu changes it, Back
+Wi-Fi transfer, Settings and System info are the last three rows of the
+library; Settings and System info are also items in the reading menu. In Settings, Prev/Next pick a setting, Menu changes it, Back
 leaves. System info shows the battery voltage and charge, the card and free
 memory; any button reads them again, Back leaves. They are saved to
 `SETTINGS.TXT`, which can also be edited by hand:
@@ -118,6 +133,7 @@ text_size = 24
 line_spacing = Normal
 margins = Normal
 alignment = Justified
+hyphenation = On
 paragraphs = Indented
 status_line = Full
 page_buttons = Normal
@@ -131,6 +147,12 @@ on the SD card. Shades are shown as the panel's 8 gray levels; pass
 `--true-gray` for the full 8-bit canvas.
 
 Sleep screen pictures come from `SLEEP/` inside the books directory.
+
+Wi-Fi transfer serves its page at `http://127.0.0.1:8080/` (`--port` for
+another) once `WIFI.TXT` in the state directory names a network; any name
+will do. Uploads and deletions change the books directory. Headless,
+`--keys ... --out DIR --serve` keeps serving after the keys, writing
+`serve.png` after each change, until stopped.
 
 For tests, `--keys` runs headless: `n` Next, `p` Prev, `m` Menu, `b` Back,
 `z` the sleep screen. It writes a PNG of the screen before the first key and

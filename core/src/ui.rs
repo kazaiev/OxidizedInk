@@ -11,12 +11,16 @@ use alloc::vec::Vec;
 
 use crate::epub::Epub;
 use crate::fonts::{Fonts, Meter};
+use crate::hyphen::{self, Lang};
 use crate::image;
 use crate::layout::{page_of, Item, Layout, Pos};
 use crate::render::{Canvas, Renderer, BLACK, WHITE};
 use crate::settings::{Settings, SleepShows, StatusLine, SETTINGS, TEXT_SIZE};
 use crate::text::{Chapter, BOLD, ITALIC};
 use crate::{Error, ReadAt};
+
+mod transfer;
+pub use transfer::{Network, Wifi, WIFI_FILE};
 
 /// Portrait canvas size in pixels.
 pub const WIDTH: i32 = 600;
@@ -89,15 +93,32 @@ pub enum Input {
 /// (state in `/READER/`); the simulator uses directories.
 pub trait Storage {
     type Book: ReadAt;
+    type Upload: Upload;
     /// `(file name, size in bytes)` of each book.
     fn list_books(&mut self) -> Vec<(String, u64)>;
     fn open_book(&mut self, name: &str) -> Result<Self::Book, Error>;
+    /// Starts a new book file for an upload the browser calls `name` (an
+    /// `.epub` without directories). Returns the file's name as
+    /// `list_books` will give it, which may differ: the card keeps short
+    /// names.
+    fn create_book(&mut self, name: &str) -> Result<(String, Self::Upload), Error>;
+    /// Deletes a book file, by its name in `list_books`.
+    fn delete_book(&mut self, name: &str) -> Result<(), Error>;
     /// Reads a state file. Names are 8.3 (`LAST.TXT`, `1A2B3C4D.POS`).
     fn load(&mut self, name: &str) -> Option<Vec<u8>>;
     fn save(&mut self, name: &str, data: &[u8]) -> Result<(), Error>;
+    /// Deletes a state file, if there is one.
+    fn remove(&mut self, name: &str);
     /// The sleep screen's pictures (JPEG and PNG files in `/SLEEP/`), sorted.
     fn list_pictures(&mut self) -> Vec<String>;
     fn load_picture(&mut self, name: &str) -> Option<Vec<u8>>;
+}
+
+/// A book file being written as it arrives.
+pub trait Upload {
+    fn write(&mut self, data: &[u8]) -> Result<(), Error>;
+    /// Closes the file. Dropping it instead leaves it incomplete.
+    fn finish(self) -> Result<(), Error>;
 }
 
 #[derive(Debug, Clone)]
@@ -117,8 +138,16 @@ enum Screen {
     /// `from_reading`: opened from the reading menu rather than the library.
     Settings { sel: usize, from_reading: bool },
     System { from_reading: bool },
+    Transfer,
     Message(String),
 }
+
+/// The library's rows after the books: label and help.
+const TOOLS: [(&str, &str); 3] = [
+    ("Wi-Fi transfer", "Send books from a browser"),
+    ("Settings", "Text, layout, buttons and sleep"),
+    ("System info", "Battery, card and memory"),
+];
 
 const MENU: [&str; 7] = ["Back to book", "Contents", "Larger text", "Smaller text", "Settings", "System info", "Library"];
 
@@ -166,6 +195,8 @@ struct Reader<F: ReadAt> {
     marks: Vec<(usize, usize)>,
     /// Pictures drawn lately, oldest first.
     pictures: Vec<Picture>,
+    /// Hyphenation patterns for the book's language.
+    lang: Option<Lang>,
 }
 
 impl<F: ReadAt> Reader<F> {
@@ -282,7 +313,8 @@ impl<F: ReadAt> Reader<F> {
     }
 }
 
-fn layout<'f>(fonts: &'f Fonts, s: &Settings) -> Layout<'f> {
+/// The reading view's layout for `s`, hyphenating with `lang`'s patterns.
+fn layout<'f>(fonts: &'f Fonts, s: &Settings, lang: Option<Lang>) -> Layout<'f> {
     let (side, top) = s.margins();
     let bottom = if s.status_line() == StatusLine::Off { HEIGHT - top } else { TEXT_BOTTOM };
     Layout {
@@ -295,6 +327,7 @@ fn layout<'f>(fonts: &'f Fonts, s: &Settings) -> Layout<'f> {
         line_pct: s.line_pct(),
         justify: s.justify(),
         spaced: s.spaced(),
+        hyphenate: lang.filter(|_| s.hyphenate()),
     }
 }
 
@@ -452,6 +485,13 @@ pub struct App<S: Storage> {
     pub status_battery: Option<u8>,
     /// `(label, value)` rows for the System info screen, from the platform.
     pub system: Vec<(String, String)>,
+    /// The network from `WIFI.TXT`, read when the transfer screen opens.
+    wifi: Option<Wifi>,
+    /// The transfer screen's connection, which the platform moves on from
+    /// `Connecting`.
+    pub network: Network,
+    /// What the transfer screen has done: "Received …", "Deleted …".
+    transfer_log: Vec<String>,
 }
 
 impl<S: Storage> App<S> {
@@ -468,6 +508,9 @@ impl<S: Storage> App<S> {
             battery: None,
             status_battery: None,
             system: Vec::new(),
+            wifi: None,
+            network: Network::NotSetUp,
+            transfer_log: Vec::new(),
         }
     }
 
@@ -482,15 +525,19 @@ impl<S: Storage> App<S> {
     /// Restores settings and reopens the last book at its saved page, or
     /// shows the library.
     pub fn start(&mut self) {
-        if let Some(d) = self.storage.load(SETTINGS_FILE) {
-            self.settings = Settings::parse(&d);
-        }
+        self.load_settings();
         self.scan_library();
         let last = self.storage.load(LAST_FILE).and_then(|d| String::from_utf8(d).ok());
         if let Some(i) = last.and_then(|f| self.library.iter().position(|b| b.file == f.trim())) {
             self.open_book(i);
         } else {
             self.screen = Screen::Library { sel: 0 };
+        }
+    }
+
+    fn load_settings(&mut self) {
+        if let Some(d) = self.storage.load(SETTINGS_FILE) {
+            self.settings = Settings::parse(&d);
         }
     }
 
@@ -559,6 +606,7 @@ impl<S: Storage> App<S> {
             [s, b, o, ..] => (s as usize, Pos { block: b as u32, byte: o as u32 }),
             _ => (0, Pos::default()),
         };
+        let lang = hyphen::lang(&epub.language);
         let mut reader = Reader {
             info,
             epub,
@@ -568,8 +616,9 @@ impl<S: Storage> App<S> {
             page: 0,
             marks: Vec::new(),
             pictures: Vec::new(),
+            lang,
         };
-        let layout = layout(&self.fonts, &self.settings);
+        let layout = layout(&self.fonts, &self.settings, lang);
         let spine = if spine < reader.epub.spine.len() { spine } else { 0 };
         if !reader.goto(&layout, spine, Target::At(pos)) && !reader.goto(&layout, 0, Target::First) {
             self.screen = Screen::Message(format!("{} has no text", reader.info.title));
@@ -594,13 +643,18 @@ impl<S: Storage> App<S> {
         }
     }
 
+    /// The open book's hyphenation patterns.
+    fn book_lang(&self) -> Option<Lang> {
+        self.reader.as_ref().and_then(|r| r.lang)
+    }
+
     fn save_settings(&mut self) {
         let _ = self.storage.save(SETTINGS_FILE, self.settings.to_text().as_bytes());
     }
 
     /// Repaginates the open book after a settings change, keeping the place.
     fn relayout(&mut self) {
-        let layout = layout(&self.fonts, &self.settings);
+        let layout = layout(&self.fonts, &self.settings, self.book_lang());
         if let Some(r) = &mut self.reader {
             r.repaginate(&layout);
         }
@@ -616,7 +670,7 @@ impl<S: Storage> App<S> {
 
     /// Handles one input. Returns true if the screen changed.
     pub fn handle(&mut self, input: Input) -> bool {
-        let layout = layout(&self.fonts, &self.settings);
+        let layout = layout(&self.fonts, &self.settings, self.book_lang());
         let screen = self.screen.clone();
         match screen {
             Screen::Reading => {
@@ -697,16 +751,18 @@ impl<S: Storage> App<S> {
                 true
             }
             Screen::Library { sel } => {
-                // The books, then rows for the settings and system info.
-                let n = self.library.len() + 2;
+                // The books, then the TOOLS rows.
+                let books = self.library.len();
+                let n = books + TOOLS.len();
                 match input {
                     Input::Prev => self.screen = Screen::Library { sel: (sel + n - 1) % n },
                     Input::Next => self.screen = Screen::Library { sel: (sel + 1) % n },
-                    Input::Menu if sel < self.library.len() => self.open_book(sel),
-                    Input::Menu if sel == self.library.len() => {
-                        self.screen = Screen::Settings { sel: 0, from_reading: false }
-                    }
-                    Input::Menu => self.screen = Screen::System { from_reading: false },
+                    Input::Menu if sel < books => self.open_book(sel),
+                    Input::Menu => match sel - books {
+                        0 => self.open_transfer(),
+                        1 => self.screen = Screen::Settings { sel: 0, from_reading: false },
+                        _ => self.screen = Screen::System { from_reading: false },
+                    },
                     Input::Back if self.reader.is_some() => self.screen = Screen::Reading,
                     _ => return false,
                 }
@@ -726,7 +782,7 @@ impl<S: Storage> App<S> {
                         self.screen = if from_reading && self.reader.is_some() {
                             Screen::Reading
                         } else {
-                            Screen::Library { sel: self.library.len() }
+                            Screen::Library { sel: self.library.len() + 1 }
                         };
                     }
                 }
@@ -739,11 +795,12 @@ impl<S: Storage> App<S> {
                     self.screen = if from_reading && self.reader.is_some() {
                         Screen::Reading
                     } else {
-                        Screen::Library { sel: self.library.len() + 1 }
+                        Screen::Library { sel: self.library.len() + 2 }
                     };
                 }
                 true
             }
+            Screen::Transfer => self.handle_transfer(input),
             Screen::Message(_) => {
                 self.screen = Screen::Library { sel: 0 };
                 true
@@ -783,6 +840,9 @@ impl<S: Storage> App<S> {
         if matches!(self.screen, Screen::Settings { .. }) {
             self.relayout();
         }
+        if self.screen == Screen::Transfer {
+            self.close_transfer();
+        }
         self.screen = target;
         true
     }
@@ -810,6 +870,7 @@ impl<S: Storage> App<S> {
             Screen::Library { sel } => self.draw_library(canvas, sel),
             Screen::Settings { sel, .. } => self.draw_settings(canvas, sel),
             Screen::System { .. } => self.draw_system(canvas),
+            Screen::Transfer => self.draw_transfer(canvas),
             Screen::Message(m) => self.centered(canvas, 0, 24, HEIGHT / 2, &m),
         }
     }
@@ -885,7 +946,7 @@ impl<S: Storage> App<S> {
 
     fn draw_reading(&mut self, canvas: &mut Canvas) {
         let Some(r) = &mut self.reader else { return };
-        let layout = layout(&self.fonts, &self.settings);
+        let layout = layout(&self.fonts, &self.settings, r.lang);
         let page = layout.page(&r.chapter, r.pos());
         self.renderer.draw_page(&self.fonts, canvas, &r.chapter, &page);
         for item in &page.items {
@@ -986,24 +1047,19 @@ impl<S: Storage> App<S> {
         self.draw_list(canvas, &title, &rows, sel);
     }
 
-    /// The books with their covers, then rows for the settings and system
-    /// info.
+    /// The books with their covers, then the TOOLS rows.
     fn draw_library(&mut self, canvas: &mut Canvas, sel: usize) {
         self.draw_header(canvas, "Library");
         let books = self.library.len();
         let per_page = rows_per_page(BOOK_ROW);
         let first = sel / per_page * per_page;
-        for k in first..(books + 2).min(first + per_page) {
+        for k in first..(books + TOOLS.len()).min(first + per_page) {
             let y = LIST_TOP + (k - first) as i32 * BOOK_ROW;
             // Where the row's text starts; selection inverts it from there.
             let x = if k < books {
                 self.draw_book(canvas, k, y)
             } else {
-                let (label, help) = if k == books {
-                    ("Settings", "Text, layout, buttons and sleep")
-                } else {
-                    ("System info", "Battery, card and memory")
-                };
+                let (label, help) = TOOLS[k - books];
                 let x = MARGIN_X + 12;
                 self.text(canvas, BOLD, 22, x, y + 58, label);
                 self.text(canvas, ITALIC, 18, x, y + 88, help);
@@ -1013,11 +1069,11 @@ impl<S: Storage> App<S> {
                 canvas.invert_rect(x - 12, y + 2, WIDTH - MARGIN_X - x + 12, BOOK_ROW - 4);
             }
         }
-        self.draw_list_page(canvas, sel, per_page, books + 2);
+        self.draw_list_page(canvas, sel, per_page, books + TOOLS.len());
         if books == 0 {
-            let y = LIST_TOP + 2 * BOOK_ROW + 48;
+            let y = LIST_TOP + TOOLS.len() as i32 * BOOK_ROW + 48;
             self.text(canvas, 0, 22, MARGIN_X + 12, y, "No books found.");
-            self.text(canvas, ITALIC, 18, MARGIN_X + 12, y + 36, "Copy .epub files to the SD card.");
+            self.text(canvas, ITALIC, 18, MARGIN_X + 12, y + 36, "Copy .epub files to the SD card, or use Wi-Fi transfer.");
         }
     }
 

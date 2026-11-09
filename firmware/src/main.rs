@@ -1,4 +1,4 @@
-//! OxidizedInk firmware for the Inkplate 6 V2.
+//! oxidized-ink firmware for the Inkplate 6 V2.
 //!
 //! Boot puts the board in a safe state, shows the logo (after power-on, not
 //! after a sleep), powers the SD card and starts the reader core, which
@@ -14,6 +14,9 @@
 //!
 //! The page buttons on the side give Prev, Next and Menu, and holding Menu
 //! gives Back. The board's own wake button is not used (see `buttons`).
+//!
+//! Wi-Fi transfer runs in a boot of its own (see `wifi`): the board restarts
+//! into it, and restarts again to leave.
 
 #![no_std]
 #![no_main]
@@ -24,8 +27,10 @@ mod battery;
 mod buttons;
 mod expander;
 mod panel;
+mod psram;
 mod sd;
 mod storage;
+mod wifi;
 
 use alloc::format;
 use alloc::string::String;
@@ -39,13 +44,16 @@ use esp_hal::delay::Delay;
 use esp_hal::gpio::{self, AnyPin, InputConfig, Pin};
 use esp_hal::i2c::master::{Config as I2cConfig, Error, I2c};
 use esp_hal::main;
+use esp_hal::peripherals::{FROM_CPU_INTR0, TIMG0, WIFI};
 use esp_hal::rtc_cntl::wakeup_cause;
+use esp_hal::system::software_reset;
 use esp_hal::time::{Duration, Instant, Rate};
+use esp_hal::timer::timg::TimerGroup;
 use esp_hal::Blocking;
 use inkreader_core::fonts::Fonts;
 use inkreader_core::render::{Canvas, Renderer};
 use inkreader_core::settings::Settings;
-use inkreader_core::ui::{draw_logo, App, SleepScreen, Storage, HEIGHT, WIDTH};
+use inkreader_core::ui::{draw_logo, App, Network, SleepScreen, Storage, Wifi, HEIGHT, WIDTH, WIFI_FILE};
 use log::{info, warn};
 
 use battery::Battery;
@@ -54,6 +62,7 @@ use expander::{pin, Expander, EXP1, EXP2};
 use panel::{pack_portrait, Bus, Panel, Refresh, FB_SIZE};
 use sd::Sd;
 use storage::CardStorage;
+use wifi::Net;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -70,6 +79,14 @@ const SHOWS_EMPTY: u8 = 0x5a;
 /// none. The page drawn after the wake must match the panel.
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static mut STATUS_BATTERY_AT_SLEEP: u8 = 0xff;
+/// What a restart is for, kept in RTC memory: `BOOT_WIFI`, `BOOT_FROM_WIFI`,
+/// or anything else for a normal boot.
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static mut BOOT_MODE: u8 = 0;
+/// Start Wi-Fi transfer.
+const BOOT_WIFI: u8 = 0x3c;
+/// Back from Wi-Fi transfer: open the library.
+const BOOT_FROM_WIFI: u8 = 0xc3;
 
 /// Runs from the panic handler before the backtrace is printed.
 #[no_mangle]
@@ -232,6 +249,147 @@ fn update_status<S: Storage>(battery: &mut Battery, bus: &mut Bus, app: &mut App
     app.system.push(row("Firmware", String::from(env!("CARGO_PKG_VERSION"))));
 }
 
+fn internal_free() -> usize {
+    HEAP.free_caps(MemoryCapability::Internal.into())
+}
+
+/// Restarts the board for `mode`. The SD card goes off first: a powered card
+/// can upset the boot (see `sd`).
+fn restart(mode: u8, bus: &mut Bus) -> ! {
+    info!("restarting");
+    unsafe { BOOT_MODE = mode };
+    let _ = bus.exp1.set_input(&mut bus.i2c, pin::SD_POWER, false);
+    Delay::new().delay_millis(100);
+    buttons::flush_log();
+    software_reset()
+}
+
+/// Wi-Fi transfer: joins the network from `WIFI.TXT` and serves the
+/// transfer page until the screen is left or sits idle, then restarts into
+/// the reader. `shown`: the panel still shows the transfer screen, drawn
+/// before the restart.
+#[allow(clippy::too_many_arguments)]
+fn run_wifi(
+    shown: bool,
+    sd: Sd,
+    radio: WIFI<'static>,
+    timg0: TIMG0<'static>,
+    intr: FROM_CPU_INTR0<'static>,
+    screen: &mut Screen,
+    bus: &mut Bus,
+    buttons: &mut Buttons,
+    battery: &mut Battery,
+    card_mb: u64,
+) -> ! {
+    let mut storage = CardStorage::new(sd);
+    let config = storage.load(WIFI_FILE).and_then(|d| Wifi::parse(&d));
+    // The scheduler and the radio first, while internal RAM is free.
+    esp_rtos::start(TimerGroup::new(timg0).timer0, intr);
+    let mut radio = Some(radio);
+    let mut net: Option<Net> = None;
+    let mut failed = None;
+    if let Some(c) = &config {
+        match Net::new(radio.take().unwrap(), c) {
+            Ok(n) => net = Some(n),
+            Err(why) => failed = Some(why),
+        }
+    }
+    info!("Wi-Fi started, {} KB internal RAM free", internal_free() / 1024);
+    let mut app = App::new(storage);
+    update_status(battery, bus, &mut app, card_mb);
+    app.start_transfer();
+    if shown {
+        screen.assume_shown(&mut app);
+    } else {
+        screen.show_app(&mut app, bus);
+    }
+    if let Some(why) = failed {
+        app.network = Network::Failed(why);
+        screen.show_app(&mut app, bus);
+    }
+    let mut active = Instant::now();
+    let mut checked = Instant::now();
+    // When the network was joined, while waiting for DHCP.
+    let mut joined: Option<Instant> = None;
+    let mut low = internal_free();
+    loop {
+        if app.network == Network::Connecting && joined.is_none() {
+            // Joining blocks; the screen already says so.
+            if net.is_none() {
+                let c = app.wifi_wanted().cloned();
+                match (c, radio.take()) {
+                    (Some(c), Some(r)) => match Net::new(r, &c) {
+                        Ok(n) => net = Some(n),
+                        Err(why) => app.network = Network::Failed(why),
+                    },
+                    _ => app.network = Network::Failed(String::from("restart the reader to try again")),
+                }
+            }
+            if let Some(n) = &mut net {
+                match n.connect() {
+                    Ok(()) => joined = Some(Instant::now()),
+                    Err(why) => app.network = Network::Failed(why),
+                }
+            }
+            if app.network != Network::Connecting {
+                screen.show_app(&mut app, bus);
+            }
+        }
+        if let Some(n) = &mut net {
+            if n.poll() {
+                app.network = match n.address {
+                    Some(a) => Network::Ready(format!("http://{}/", a)),
+                    None => Network::Failed(String::from("the connection dropped")),
+                };
+                joined = None;
+                screen.show_app(&mut app, bus);
+            }
+            if joined.is_some_and(|t| t.elapsed() >= Duration::from_secs(30)) {
+                app.network = Network::Failed(String::from("the network gave no address"));
+                joined = None;
+                screen.show_app(&mut app, bus);
+            }
+            if let Some(h) = n.request() {
+                let t = Instant::now();
+                let mut conn = n.connection(h);
+                let changed = app.serve(&mut conn);
+                let (kb, ms) = (conn.received / 1024, t.elapsed().as_millis());
+                n.close(h);
+                info!("request served in {} ms, {} KB in ({} KB/s)", ms, kb, kb as u64 * 1000 / ms.max(1));
+                active = Instant::now();
+                if changed {
+                    screen.show_app(&mut app, bus);
+                }
+            }
+        }
+        if let Some(input) = buttons.poll(bus) {
+            active = Instant::now();
+            let changed = app.handle(input);
+            if !app.transfer_open() {
+                break;
+            }
+            if changed {
+                screen.show_app(&mut app, bus);
+            }
+        }
+        if active.elapsed() >= idle_time(app.settings()) {
+            info!("Wi-Fi idle");
+            break;
+        }
+        low = low.min(internal_free());
+        if checked.elapsed() >= Duration::from_secs(30) {
+            checked = Instant::now();
+            info!("internal RAM: {} KB free, lowest {} KB", internal_free() / 1024, low / 1024);
+            update_status(battery, bus, &mut app, card_mb);
+            if app.battery_empty() {
+                break;
+            }
+        }
+        wifi::pause(net.as_mut().map_or(10, |n| n.idle_ms(5)));
+    }
+    restart(BOOT_FROM_WIFI, bus)
+}
+
 /// Expander 1 into a safe state. VCOM and PWRUP go low before WAKEUP, as in
 /// the PMIC's power-down order, in case the last firmware left it on.
 fn safe_state(exp1: &mut Expander, i2c: &mut I2c<'_, Blocking>) -> Result<(), Error> {
@@ -257,9 +415,26 @@ fn main() -> ! {
     let boot = Instant::now();
     let delay = Delay::new();
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 98768);
+    // More internal RAM, which Wi-Fi needs; it must come before PSRAM,
+    // which the allocator would otherwise fill first.
+    esp_alloc::heap_allocator!(size: 48 * 1024);
     esp_alloc::psram_allocator!(p.PSRAM, esp_hal::psram);
     let woke = !wakeup_cause().is_empty();
-    info!("oxidized-ink starting{}", if woke { " (woken from sleep)" } else { "" });
+    let mode = unsafe { BOOT_MODE };
+    unsafe { BOOT_MODE = 0 };
+    let restarted = mode == BOOT_WIFI || mode == BOOT_FROM_WIFI;
+    // `TEST_WIFI=1 cargo build --release` starts Wi-Fi transfer on power-on,
+    // to try it without the buttons.
+    let test_wifi = option_env!("TEST_WIFI").is_some() && !woke && !restarted;
+    info!(
+        "oxidized-ink starting{}",
+        match () {
+            _ if woke => " (woken from sleep)",
+            _ if mode == BOOT_WIFI => " for Wi-Fi",
+            _ if mode == BOOT_FROM_WIFI => " after Wi-Fi",
+            _ => "",
+        }
+    );
 
     let mut i2c = I2c::new(p.I2C0, I2cConfig::default().with_frequency(Rate::from_khz(100)))
         .expect("I2C config")
@@ -301,7 +476,7 @@ fn main() -> ! {
     }
     let mut battery = Battery::new(p.ADC1, p.GPIO35);
     info!("ADC reference: {} mV", battery.vref);
-    if !woke {
+    if !woke && !restarted {
         screen.show_logo(&mut bus);
     }
 
@@ -317,6 +492,10 @@ fn main() -> ! {
     };
 
     match card {
+        Some(sd) if mode == BOOT_WIFI || test_wifi => {
+            let card_mb = sd.size / 1_000_000;
+            run_wifi(!test_wifi, sd, p.WIFI, p.TIMG0, p.FROM_CPU_INTR0, &mut screen, &mut bus, &mut buttons, &mut battery, card_mb)
+        }
         Some(sd) => {
             let card_mb = sd.size / 1_000_000;
             info!("SD card: {} MB", card_mb);
@@ -333,6 +512,9 @@ fn main() -> ! {
                 SHOWS_EMPTY
             } else {
                 app.start();
+                if mode == BOOT_FROM_WIFI {
+                    app.close_transfer();
+                }
                 info!("reader started in {} ms", boot.elapsed().as_millis());
                 // If the panel still shows the page `settle` left there, the
                 // first refresh can be a partial one, and the press that woke
@@ -358,6 +540,9 @@ fn main() -> ! {
                     info!("button: {:?}, handled in {} ms", input, t.elapsed().as_millis());
                     if changed {
                         screen.show_app(&mut app, &mut bus);
+                    }
+                    if app.wifi_wanted().is_some() {
+                        restart(BOOT_WIFI, &mut bus);
                     }
                 }
                 let sleep = app.sleep_screen();

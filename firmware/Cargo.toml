@@ -28,10 +28,22 @@ nb = "1.1.0"
 embedded-sdmmc = { version = "0.10.0", default-features = false }
 embedded-hal-bus = "0.3.0"
 inkreader-core = { path = "../core" }
+# Wi-Fi (see src/wifi.rs). esp-radio is a prerelease, so it's pinned.
+esp-radio = { version = "=1.0.0-beta.1", features = ["esp32", "wifi", "log-04", "unstable"] }
+esp-rtos = { version = "0.4.0", features = ["esp32", "esp-radio", "esp-alloc", "log-04"] }
+embassy-net-driver = "0.2.0"
+smoltcp = { version = "0.14.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-dhcpv4", "log"] }
 
 [profile.dev]
 # The unoptimized build is too slow and too big for the ESP32.
 opt-level = "s"
+
+# esp-radio's docs: the radio needs opt-level 2 or 3 to work.
+[profile.dev.package.esp-radio]
+opt-level = 3
+
+[profile.release.package.esp-radio]
+opt-level = 3
 
 [profile.release]
 codegen-units = 1

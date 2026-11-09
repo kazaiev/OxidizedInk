@@ -18,6 +18,7 @@ extern crate alloc;
 
 mod expander;
 mod panel;
+mod psram;
 mod sd;
 
 use alloc::vec;
@@ -33,6 +34,7 @@ use esp_hal::time::{Instant, Rate};
 use esp_hal::main;
 use inkreader_core::epub::Epub;
 use inkreader_core::fonts::Fonts;
+use inkreader_core::hyphen::Lang;
 use inkreader_core::layout::{Layout, Pos};
 use inkreader_core::render::{Canvas, Renderer, BLACK};
 use inkreader_core::text::{Chapter, BOLD, ITALIC};
@@ -90,6 +92,7 @@ fn layout(fonts: &Fonts) -> Layout<'_> {
         line_pct: 140,
         justify: true,
         spaced: false,
+        hyphenate: Some(Lang::English),
     }
 }
 

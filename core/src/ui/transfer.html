@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OxidizedInk</title>
+<style>
+:root { --bg: #fff; --fg: #161616; --mute: #6b6b6b; --line: #dcdcdc; --accent: #a8431a; --bad: #b00020; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #151515; --fg: #ececec; --mute: #9a9a9a; --line: #353535; --accent: #e07a4f; --bad: #ff6b7f; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.45 system-ui, sans-serif; }
+main { max-width: 640px; margin: 0 auto; padding: 28px 16px 48px; }
+h1 { font: 700 26px/1 ui-monospace, Menlo, Consolas, monospace; margin: 0 0 20px; }
+h1 span { color: var(--mute); }
+h2 { font-size: 15px; font-weight: 600; color: var(--mute); margin: 28px 0 8px; }
+#drop { border: 2px dashed var(--line); border-radius: 12px; padding: 32px 16px; text-align: center; cursor: pointer; }
+#drop.over { border-color: var(--accent); }
+#drop strong { color: var(--accent); }
+#drop p { margin: 4px 0; }
+.mute { color: var(--mute); font-size: 14px; }
+ul { list-style: none; margin: 0; padding: 0; }
+li { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+li div { flex: 1; min-width: 0; }
+li a, li b, li i { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+li a { color: inherit; font-weight: 700; text-decoration: none; }
+li a:hover { color: var(--accent); }
+li i { color: var(--mute); font-size: 14px; }
+progress { width: 100%; height: 6px; accent-color: var(--accent); }
+.bad { color: var(--bad); }
+button { font: inherit; font-size: 14px; color: var(--fg); background: none; border: 1px solid var(--line); border-radius: 8px; padding: 4px 12px; cursor: pointer; }
+button:hover { border-color: var(--bad); color: var(--bad); }
+</style>
+</head>
+<body>
+<main>
+<h1>Oxidized<span>Ink</span></h1>
+<div id="drop" tabindex="0">
+  <p><strong>Drop .epub files here</strong></p>
+  <p class="mute">or click to choose them</p>
+  <input id="pick" type="file" accept=".epub,application/epub+zip" multiple hidden>
+</div>
+<ul id="queue"></ul>
+<h2 id="count">Books</h2>
+<ul id="books"></ul>
+</main>
+<script>
+const $ = (s) => document.querySelector(s);
+const el = (tag, text, cls) => { const e = document.createElement(tag); if (text) e.textContent = text; if (cls) e.className = cls; return e; };
+const size = (n) => n < 1e6 ? Math.max(1, Math.round(n / 1e3)) + ' KB' : (n / 1e6).toFixed(1) + ' MB';
+
+async function load() {
+  const books = await (await fetch('/books')).json();
+  $('#count').textContent = books.length === 1 ? '1 book' : books.length + ' books';
+  $('#books').replaceChildren(...books.map((b) => {
+    const li = el('li'), text = el('div');
+    const title = el('a', b.title);
+    title.href = '/books/' + encodeURIComponent(b.file);
+    title.title = 'Download';
+    text.append(title, el('i', [b.author, size(b.size)].filter(Boolean).join(' · ')));
+    const del = el('button', 'Delete');
+    del.onclick = async () => {
+      if (!confirm('Delete “' + b.title + '” from the reader?')) return;
+      del.disabled = true;
+      const r = await fetch('/books/' + encodeURIComponent(b.file), { method: 'DELETE' });
+      if (!r.ok) alert(await r.text());
+      load();
+    };
+    li.append(text, del);
+    return li;
+  }));
+}
+
+// The reader takes one upload at a time.
+const todo = [];
+let busy = false;
+
+function add(files) {
+  for (const f of files) {
+    const li = el('li'), text = el('div'), bar = el('progress'), note = el('i', 'Waiting');
+    bar.max = 1; bar.value = 0;
+    text.append(el('b', f.name), bar, note);
+    li.append(text);
+    $('#queue').append(li);
+    if (!/\.epub$/i.test(f.name)) { note.textContent = 'Not an .epub file'; note.className = 'bad'; continue; }
+    todo.push({ f, bar, note });
+  }
+  next();
+}
+
+function next() {
+  if (busy || !todo.length) return;
+  busy = true;
+  const { f, bar, note } = todo.shift();
+  note.textContent = 'Sending ' + size(f.size);
+  const x = new XMLHttpRequest();
+  x.open('PUT', '/books/' + encodeURIComponent(f.name));
+  x.upload.onprogress = (e) => { if (e.lengthComputable) bar.value = e.loaded / e.total; };
+  const done = (ok, text) => {
+    note.textContent = text; note.className = ok ? '' : 'bad'; bar.value = ok ? 1 : bar.value;
+    busy = false; load(); next();
+  };
+  x.onload = () => x.status === 201 ? done(true, 'Sent') : done(false, x.responseText || 'Failed');
+  x.onerror = () => done(false, 'Connection lost');
+  x.send(f);
+}
+
+const drop = $('#drop'), pick = $('#pick');
+drop.onclick = () => pick.click();
+drop.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') pick.click(); };
+pick.onchange = () => { add(pick.files); pick.value = ''; };
+drop.ondragover = (e) => { e.preventDefault(); drop.classList.add('over'); };
+drop.ondragleave = () => drop.classList.remove('over');
+drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove('over'); add(e.dataTransfer.files); };
+load();
+</script>
+</body>
+</html>

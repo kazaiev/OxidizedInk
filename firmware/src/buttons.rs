@@ -86,35 +86,42 @@ impl Buttons {
             delay.delay_millis(10);
         }
         loop {
-            let down = self.read(bus);
-            if down != 0 {
-                // The first button down decides; the others wait until it is
-                // let go.
-                let button = down & down.wrapping_neg();
-                let t = Instant::now();
-                let mut held = 0;
-                let mut quiet = 0;
-                while quiet < 3 {
-                    delay.delay_millis(10);
-                    if self.read(bus) & button != 0 {
-                        held = t.elapsed().as_millis();
-                        quiet = 0;
-                    } else {
-                        quiet += 1;
-                    }
+            if let Some(input) = self.poll(bus) {
+                if LIGHT_SLEEP {
+                    info!("light sleep: {} of {} ms", asleep, start.elapsed().as_millis());
                 }
-                if held >= MIN_MS {
-                    if LIGHT_SLEEP {
-                        info!("light sleep: {} of {} ms", asleep, start.elapsed().as_millis());
-                    }
-                    return Some(input(button, held));
-                }
+                return Some(input);
             }
             if Instant::now() >= deadline {
                 return None;
             }
             asleep += self.nap(deadline);
         }
+    }
+
+    /// The input for a press, if a button is down: waits for it to be let
+    /// go, but not for one to go down. For loops with other work, such as
+    /// serving Wi-Fi, which can't light-sleep.
+    pub fn poll(&mut self, bus: &mut Bus) -> Option<Input> {
+        let down = self.read(bus);
+        if down == 0 {
+            return None;
+        }
+        // The first button down decides; the others wait until it is let go.
+        let button = down & down.wrapping_neg();
+        let t = Instant::now();
+        let mut held = 0;
+        let mut quiet = 0;
+        while quiet < 3 {
+            Delay::new().delay_millis(10);
+            if self.read(bus) & button != 0 {
+                held = t.elapsed().as_millis();
+                quiet = 0;
+            } else {
+                quiet += 1;
+            }
+        }
+        (held >= MIN_MS).then(|| input(button, held))
     }
 
     /// Light-sleeps until a button goes down or `deadline`, and returns the
@@ -219,7 +226,7 @@ fn restore_pll() {
 
 /// Waits until UART0 has sent all log output. esp-println leaves bytes in the
 /// UART's FIFO, and on the ESP32 its flush does nothing.
-fn flush_log() {
+pub fn flush_log() {
     const UART0_STATUS: *const u32 = 0x3ff4_001c as *const u32;
     loop {
         let status = unsafe { UART0_STATUS.read_volatile() };

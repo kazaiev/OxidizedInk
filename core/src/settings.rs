@@ -18,12 +18,13 @@ pub const TEXT_SIZE: usize = 0;
 pub const LINE_SPACING: usize = 1;
 pub const MARGINS: usize = 2;
 pub const ALIGNMENT: usize = 3;
-pub const PARAGRAPHS: usize = 4;
-pub const STATUS_LINE: usize = 5;
-pub const PAGE_BUTTONS: usize = 6;
-pub const SLEEP: usize = 7;
-pub const SLEEP_SCREEN: usize = 8;
-pub const FULL_REFRESH: usize = 9;
+pub const HYPHENATION: usize = 4;
+pub const PARAGRAPHS: usize = 5;
+pub const STATUS_LINE: usize = 6;
+pub const PAGE_BUTTONS: usize = 7;
+pub const SLEEP: usize = 8;
+pub const SLEEP_SCREEN: usize = 9;
+pub const FULL_REFRESH: usize = 10;
 
 /// Values behind the options, in the same order.
 const FONT_SIZES: [i32; 8] = [18, 20, 22, 24, 26, 28, 32, 36];
@@ -33,7 +34,7 @@ const MARGIN_PX: [(i32, i32); 3] = [(20, 20), (36, 28), (56, 40)];
 const SLEEP_MINUTES: [u32; 6] = [1, 2, 5, 10, 15, 30];
 const FULL_REFRESH_EVERY: [u32; 4] = [1, 5, 10, 20];
 
-pub const SETTINGS: [Setting; 10] = [
+pub const SETTINGS: [Setting; 11] = [
     Setting {
         key: "text_size",
         label: "Text size",
@@ -60,6 +61,13 @@ pub const SETTINGS: [Setting; 10] = [
         label: "Alignment",
         help: "Justified lines all end at the right margin.",
         options: &["Justified", "Left"],
+        default: 0,
+    },
+    Setting {
+        key: "hyphenation",
+        label: "Hyphenation",
+        help: "Break long words at line ends: English and Ukrainian.",
+        options: &["On", "Off"],
         default: 0,
     },
     Setting {
@@ -204,6 +212,10 @@ impl Settings {
 
     pub fn justify(&self) -> bool {
         self.values[ALIGNMENT] == 0
+    }
+
+    pub fn hyphenate(&self) -> bool {
+        self.values[HYPHENATION] == 0
     }
 
     /// Paragraphs separated by space instead of a first-line indent.

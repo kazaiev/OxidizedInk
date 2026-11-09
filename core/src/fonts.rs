@@ -141,6 +141,7 @@ impl Default for Fonts {
 
 /// Walks a run of text, applying kerning between neighbors in the same face.
 /// Layout and rendering both measure with it, so they always agree.
+#[derive(Clone)]
 pub struct Meter<'a> {
     fonts: &'a Fonts,
     prev: Option<(u8, GlyphId)>,

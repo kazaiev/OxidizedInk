@@ -105,6 +105,7 @@ fn pictures_decode() {
 #[test]
 fn layout_covers_all_text() {
     use inkreader_core::fonts::Fonts;
+    use inkreader_core::hyphen;
     use inkreader_core::layout::{Item, Layout};
     use inkreader_core::text::BlockKind;
     use std::time::Instant;
@@ -136,6 +137,7 @@ fn layout_covers_all_text() {
                 line_pct: 140,
                 justify: !plain,
                 spaced: plain,
+                hyphenate: hyphen::lang(&book.language),
             };
             let mut pages = 0;
             let mut measure = 0.0;

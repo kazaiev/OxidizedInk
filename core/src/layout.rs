@@ -5,8 +5,10 @@
 //! geometry, so saved reading progress survives a settings change.
 //!
 //! Lines are broken greedily at spaces, after dashes inside words, and at soft
-//! hyphens. A word wider than the line is broken by character. Paragraph
-//! lines are justified except the last one, unless set ragged right.
+//! hyphens. A paragraph's word that would run past the line's end is
+//! hyphenated, if the book's language has patterns (see `hyphen`). A word
+//! wider than the line is broken by character. Paragraph lines are
+//! justified except the last one, unless set ragged right.
 //!
 //! Pictures keep their own size in pixels, shrunk to fit the text's width
 //! and the page, with room left for a short caption, which stays with its
@@ -15,6 +17,7 @@
 use alloc::vec::Vec;
 
 use crate::fonts::{Fonts, Meter};
+use crate::hyphen::{self, Lang};
 use crate::image;
 use crate::text::{Block, BlockKind, Chapter};
 
@@ -47,7 +50,7 @@ pub struct Line {
     /// Font size in pixels per em.
     pub px: i32,
     pub runs: Vec<Run>,
-    /// A hyphen added where the line broke at a soft hyphen: `(x, face)`.
+    /// A hyphen added where the line broke inside a word: `(x, face)`.
     pub hyphen: Option<(i32, u8)>,
 }
 
@@ -107,6 +110,15 @@ struct Break {
     last: bool,
 }
 
+/// Where the latest run of letters on a line starts, with the line's width
+/// and the meter's state just before it.
+#[derive(Clone)]
+struct WordStart<'f> {
+    at: usize,
+    width: i32,
+    meter: Meter<'f>,
+}
+
 /// Finds the style in effect at a byte offset, for bytes visited in order.
 struct Styles<'a> {
     spans: &'a [(u32, u8)],
@@ -131,6 +143,12 @@ fn is_dash(c: char) -> bool {
     matches!(c, '-' | '\u{2013}' | '\u{2014}')
 }
 
+/// Part of a word, for hyphenation. A soft hyphen counts, so a word the
+/// book has hyphenated itself is left alone, and so does an apostrophe.
+fn in_word(c: char) -> bool {
+    c.is_alphabetic() || c == '\u{ad}' || hyphen::is_apostrophe(c)
+}
+
 fn is_plain(b: &Block) -> bool {
     b.kind == BlockKind::Para && b.indent == 0
 }
@@ -151,6 +169,8 @@ pub struct Layout<'f> {
     pub justify: bool,
     /// Separate paragraphs with space instead of a first-line indent.
     pub spaced: bool,
+    /// Hyphenate paragraphs' words with these patterns.
+    pub hyphenate: Option<Lang>,
 }
 
 impl<'f> Layout<'f> {
@@ -201,9 +221,11 @@ impl<'f> Layout<'f> {
     /// `avail` font units of width.
     fn break_line(&self, b: &Block, start: usize, avail: i32) -> Break {
         let pre = b.kind == BlockKind::Pre;
+        let lang = self.hyphenate.filter(|_| b.kind == BlockKind::Para);
         let mut meter = Meter::new(self.fonts);
         let mut styles = Styles::new(b, start);
         let mut cand: Option<Break> = None;
+        let mut word: Option<WordStart> = None;
         let mut width = 0;
         let mut spaces = 0;
         let text = &b.text[start..];
@@ -233,9 +255,23 @@ impl<'f> Layout<'f> {
                     }
                 }
                 _ => {
+                    if lang.is_some() && in_word(c) && !in_word(prev) {
+                        word = Some(WordStart { at: i, width, meter: meter.clone() });
+                    }
                     let w = width + meter.next(face, c).2;
                     if w > avail && i > start {
-                        return cand.unwrap_or(Break {
+                        // Hyphenate the latest word, if it starts after the
+                        // last place the line could break and breaking there
+                        // would leave a loose line.
+                        let after = cand.map_or(start, |c| c.next);
+                        let loose = cand.is_none_or(|c| self.loose(&c, avail));
+                        let hyphenated = match (lang, &word) {
+                            (Some(lang), Some(word)) if word.at >= after && loose => {
+                                self.hyphen_break(b, lang, word, i, avail, spaces)
+                            }
+                            _ => None,
+                        };
+                        return hyphenated.or(cand).unwrap_or(Break {
                             end: i,
                             next: i,
                             width,
@@ -255,6 +291,62 @@ impl<'f> Layout<'f> {
             prev = c;
         }
         Break { end: b.text.len(), next: b.text.len(), width, spaces, hyphen: false, last: true }
+    }
+
+    /// Whether a paragraph line ending at `br` is loose enough to hyphenate
+    /// the next word instead: justified spaces stretched by more than half
+    /// their width, or a ragged line short by more than a sixth.
+    fn loose(&self, br: &Break, avail: i32) -> bool {
+        let slack = avail - br.width;
+        if self.justify {
+            slack * 2 > br.spaces.max(1) * self.fonts.glyph(0, ' ').1
+        } else {
+            slack * 6 > avail
+        }
+    }
+
+    /// The latest place before byte `limit` where the word that starts at
+    /// `word` can be hyphenated with the line still fitting in `avail`.
+    fn hyphen_break(
+        &self,
+        b: &Block,
+        lang: Lang,
+        word: &WordStart,
+        limit: usize,
+        avail: i32,
+        spaces: i32,
+    ) -> Option<Break> {
+        // A line can start inside a word, after an earlier line's hyphen, so
+        // take the whole word: its patterns depend on its ends.
+        let before = b.text[..word.at].char_indices().rev().take_while(|&(_, c)| in_word(c));
+        let from = before.last().map_or(word.at, |(i, _)| i);
+        let len = b.text[from..].find(|c: char| !in_word(c)).unwrap_or(b.text.len() - from);
+        let text = &b.text[from..from + len];
+        if text.contains('\u{ad}') {
+            return None;
+        }
+        let mut styles = Styles::new(b, word.at);
+        let mut meter = word.meter.clone();
+        let mut width = word.width;
+        let mut done = word.at;
+        let mut best = None;
+        for at in hyphen::breaks(text, lang).map(|p| from + p) {
+            if at <= word.at {
+                continue;
+            }
+            if at > limit {
+                break;
+            }
+            for c in b.text[done..at].chars() {
+                width += meter.next(styles.at(done), c).2;
+                done += c.len_utf8();
+            }
+            let w = width + self.fonts.glyph(styles.at(at - 1), '-').1;
+            if w <= avail {
+                best = Some(Break { end: at, next: at, width: w, spaces, hyphen: true, last: false });
+            }
+        }
+        best
     }
 
     /// Positions the runs of one line.
@@ -466,6 +558,64 @@ mod tests {
     use crate::text::{parse_xhtml, Image};
 
     #[test]
+    fn hyphenates_loose_paragraph_lines_between_syllables() {
+        let fonts = Fonts::new();
+        let mut layout = Layout {
+            fonts: &fonts,
+            left: 0,
+            top: 0,
+            width: 230,
+            height: 2000,
+            font_px: 24,
+            line_pct: 140,
+            justify: true,
+            spaced: false,
+            hyphenate: Some(Lang::English),
+        };
+        let ch = parse_xhtml(
+            "<p>Notwithstanding extraordinary circumstances, the representatives \
+             deliberated interminably about their responsibilities.</p>\
+             <h2>Representatives deliberated</h2>",
+            |_: &str| None,
+        );
+        let lines = |layout: &Layout| -> Vec<Line> {
+            let page = layout.page(&ch, Pos::default());
+            page.items.into_iter().filter_map(|i| if let Item::Text(l) = i { Some(l) } else { None }).collect()
+        };
+        let hyphenated: Vec<_> = lines(&layout).into_iter().filter(|l| l.hyphen.is_some()).collect();
+        assert!(hyphenated.len() >= 2);
+        let text = &ch.blocks[0].text;
+        for l in &hyphenated {
+            // Only the paragraph, not the heading.
+            assert_eq!(l.block, 0);
+            let end = l.runs.last().unwrap().end as usize;
+            let from = text[..end].rfind(' ').map_or(0, |i| i + 1);
+            let to = text[end..].find(|c: char| !c.is_alphabetic()).map_or(text.len(), |i| end + i);
+            let word = &text[from..to];
+            assert!(hyphen::breaks(word, Lang::English).any(|p| from + p == end), "{word}");
+        }
+        layout.hyphenate = None;
+        assert!(lines(&layout).iter().all(|l| l.hyphen.is_none()));
+
+        // Ukrainian, in two-byte letters.
+        layout.hyphenate = Some(Lang::Ukrainian);
+        let ch = parse_xhtml(
+            "<p>Найрізноманітніші пам'ятки національного значення \
+             відновлюються поступово.</p>",
+            |_: &str| None,
+        );
+        let page = layout.page(&ch, Pos::default());
+        let ends: Vec<_> = page
+            .items
+            .iter()
+            .filter_map(|i| if let Item::Text(l) = i { l.hyphen.and(l.runs.last()) } else { None })
+            .map(|r| &ch.blocks[0].text[..r.end as usize])
+            .collect();
+        assert!(!ends.is_empty());
+        assert!(ends.iter().all(|t| t.ends_with(char::is_alphabetic)), "{ends:?}");
+    }
+
+    #[test]
     fn pictures_fit_and_keep_their_captions() {
         let fonts = Fonts::new();
         let layout = Layout {
@@ -478,6 +628,7 @@ mod tests {
             line_pct: 140,
             justify: true,
             spaced: false,
+            hyphenate: None,
         };
         let size = |src: &str| {
             let (width, height) = match src {

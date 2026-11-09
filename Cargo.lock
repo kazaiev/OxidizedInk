@@ -247,10 +247,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hypher"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45f2b4f6b5da34d400d4c112eadcc14512cc5d04307a8eee182586d9bebd7ce6"
+
+[[package]]
 name = "inkreader-core"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "hypher",
  "libm",
  "miniz_oxide 0.8.9",
  "png",

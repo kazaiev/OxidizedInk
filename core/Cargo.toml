@@ -8,6 +8,8 @@ description = "Platform-independent e-reader logic: EPUB parsing, layout, render
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
 ab_glyph = { version = "0.2", default-features = false, features = ["libm"] }
 libm = "0.2"
+# English and Ukrainian patterns, about 48 KB. Each language is a feature.
+hypher = { version = "0.1.8", default-features = false, features = ["alloc", "english", "ukrainian"] }
 
 [dev-dependencies]
 png = "0.18.1"
