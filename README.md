@@ -1,4 +1,4 @@
-# oxidized-ink
+# OxidizedInk
 
 An EPUB e-book reader for the Soldered **Inkplate 6**, written in Rust.
 Books are parsed and laid out on the device itself. Copy `.epub` files to the
@@ -11,7 +11,10 @@ light-sleeps between page turns and deep sleeps when idle, behind the
 book's cover or a picture of your choice.
 Three buttons on the side of the case turn pages, open the menu and wake
 it. A PC simulator runs the same code. A 3D-printed case is in `case/`; the
-fit prints fit. See [HANDOFF.md](HANDOFF.md) for the full plan and status.
+fit prints fit.
+
+See [OxidizedInk](
+https://alex.k4zka.online/projects/oxidized-ink/) for the full plan and status.
 
 ## Layout
 
@@ -38,8 +41,18 @@ espflash flash --monitor target/xtensa-esp32-none-elf/release/inkreader
 
 Copy `.epub` files to the root of a FAT-formatted SD card. The three side
 buttons (wired as in `case/README.md`) are Menu, Prev and Next from the top;
-holding Menu for 0.6 s is Back. Any of them wakes the reader. The board's
-own wake button is not used.
+holding Menu for 0.6 s is Back. Holding Next while reading goes to the
+next chapter; holding Prev goes back to the start of the chapter, or from
+there to the previous one. In the library and the contents, holding them
+moves a screen at a time. "Go to %" in the reading menu jumps to a place
+in the book: Prev and Next change the percentage, holding them by 10.
+"Add bookmark" marks the page (a ribbon shows in its corner) and
+"Bookmarks" lists the marks; on a marked page the item removes it. On a
+page with footnotes (or other links inside the book), "Footnotes" lists
+them; picking one shows the note, and holding Menu goes back to the
+text.
+Any of them wakes the reader. The board's own
+wake button is not used.
 
 While it sleeps, the panel shows what the "Sleep screen" setting picks:
 
@@ -117,10 +130,11 @@ cargo run --release -p inkreader-sim -- --books ~/books
 
 | Key | Button |
 |---|---|
-| Right, Down, PageDown, Space | Next |
-| Left, Up, PageUp | Prev |
+| Right, Down, Space | Next |
+| Left, Up | Prev |
 | Enter | Menu (also selects in lists) |
 | Escape, Backspace | Back (holding Menu on the device) |
+| PageDown, PageUp | Holding Next, Prev on the device |
 
 Wi-Fi transfer, Settings and System info are the last three rows of the
 library; Settings and System info are also items in the reading menu. In Settings, Prev/Next pick a setting, Menu changes it, Back

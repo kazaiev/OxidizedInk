@@ -11,17 +11,18 @@
 //! panel's 8 gray levels unless `--true-gray` is given. `--battery` pretends
 //! a charge level, as the device reports it.
 //!
-//! In a window: Right/Down/PageDown/Space = Next, Left/Up/PageUp = Prev,
-//! Enter = Menu, Escape/Backspace = Back.
+//! In a window: Right/Down/Space = Next, Left/Up = Prev, Enter = Menu,
+//! Escape/Backspace = Back, PageDown/PageUp = holding Next/Prev (a chapter
+//! while reading, a screen in long lists).
 //!
 //! The Wi-Fi transfer screen serves its page at `http://127.0.0.1:PORT/`
 //! (8080 unless `--port` is given) once `WIFI.TXT` in the state directory
 //! names a network; any name will do.
 //!
 //! Headless, with `--keys`: presses each key in turn (`n` Next, `p` Prev,
-//! `m` Menu, `b` Back, `z` the screen the device would leave for its deep
-//! sleep) and writes `000.png` for the first screen, then one PNG after each
-//! key, into `--out`. With `--serve`, it then keeps serving the transfer
+//! `N` and `P` holding them, `m` Menu, `b` Back, `z` the screen the device
+//! would leave for its deep sleep) and writes `000.png` for the first
+//! screen, then one PNG after each key, into `--out`. With `--serve`, it then keeps serving the transfer
 //! page, writing `serve.png` after each change, until stopped.
 
 use std::fs::{self, File};
@@ -253,6 +254,8 @@ fn main() {
             let input = match k {
                 'n' => Input::Next,
                 'p' => Input::Prev,
+                'N' => Input::SkipForward,
+                'P' => Input::SkipBack,
                 'm' => Input::Menu,
                 'b' => Input::Back,
                 'z' => {
@@ -303,8 +306,10 @@ fn run_window(mut app: App<DirStorage>, mut canvas: Canvas, mut server: Server, 
     while window.is_open() {
         for key in window.get_keys_pressed(KeyRepeat::Yes) {
             let input = match key {
-                Key::Right | Key::Down | Key::PageDown | Key::Space => Input::Next,
-                Key::Left | Key::Up | Key::PageUp => Input::Prev,
+                Key::Right | Key::Down | Key::Space => Input::Next,
+                Key::Left | Key::Up => Input::Prev,
+                Key::PageDown => Input::SkipForward,
+                Key::PageUp => Input::SkipBack,
                 Key::Enter => Input::Menu,
                 Key::Escape | Key::Backspace => Input::Back,
                 _ => continue,

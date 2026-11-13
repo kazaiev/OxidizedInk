@@ -238,7 +238,7 @@ impl<S: Storage> App<S> {
             let _ = respond(conn, "500 Internal Server Error", "text/plain", b"Couldn't delete the file.");
             return false;
         }
-        for ext in ["POS", "THM"] {
+        for ext in ["POS", "THM", "BMK"] {
             self.storage.remove(&book_file(&info, ext));
         }
         self.scan_library();

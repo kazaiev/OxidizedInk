@@ -37,14 +37,18 @@ fn parse_test_books() {
         let mut blocks = 0;
         let mut chars = 0;
         let mut pictures = 0;
+        let (mut links, mut leading_in) = (0, 0);
         for i in 0..book.spine.len() {
             let ch = book.chapter(i).unwrap();
             blocks += ch.blocks.len();
             chars += ch.blocks.iter().map(|b| b.text.chars().count()).sum::<usize>();
             pictures += ch.images.len();
+            links += ch.links.len();
+            leading_in += ch.links.iter().filter(|l| book.link_target(i, &l.href).is_some()).count();
         }
         println!(
-            "{}: \"{}\" by {} — {} spine items, {} TOC entries, {} blocks, {} chars, {} pictures",
+            "{}: \"{}\" by {} — {} spine items, {} TOC entries, {} blocks, {} chars, {} pictures, \
+             {} links ({} into the text)",
             path.file_name().unwrap().to_string_lossy(),
             book.title,
             book.author,
@@ -52,7 +56,9 @@ fn parse_test_books() {
             book.toc.len(),
             blocks,
             chars,
-            pictures
+            pictures,
+            links,
+            leading_in
         );
         assert!(!book.toc.is_empty());
         assert!(chars > 10_000);

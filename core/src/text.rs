@@ -63,6 +63,17 @@ pub struct Image {
 /// More blocks than this after a picture are not a caption.
 const MAX_CAPTION: usize = 4;
 
+/// A link inside the book, such as a footnote's number: its text in a
+/// block, and where it leads, as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub block: u32,
+    /// The link's text, as byte offsets in the block's text.
+    pub start: u32,
+    pub end: u32,
+    pub href: String,
+}
+
 #[derive(Debug, Default)]
 pub struct Chapter {
     pub blocks: Vec<Block>,
@@ -72,6 +83,8 @@ pub struct Chapter {
     /// starts listed in the table of contents. Set by the reader, not parsed.
     pub breaks: Vec<usize>,
     pub images: Vec<Image>,
+    /// Links inside the book, in reading order.
+    pub links: Vec<Link>,
 }
 
 impl Chapter {
@@ -111,6 +124,8 @@ struct Builder {
     /// The last picture while its element is open, for counting its
     /// caption: `(image, its block, depth)`.
     figure: Option<(usize, usize, u16)>,
+    /// The open link: `(href, blocks so far, start in text)`.
+    link: Option<(String, usize, usize)>,
 }
 
 impl Builder {
@@ -259,6 +274,7 @@ pub fn parse_xhtml(doc: &str, mut image: impl FnMut(&str) -> Option<Image>) -> C
         lists: Vec::new(),
         depth: 0,
         figure: None,
+        link: None,
     };
     for tok in Tokenizer::new(doc) {
         match tok {
@@ -350,6 +366,13 @@ pub fn parse_xhtml(doc: &str, mut image: impl FnMut(&str) -> Option<Image>) -> C
                     "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                         b.heading = n.as_bytes()[1] - b'0';
                     }
+                    // Only links inside the book: no scheme such as http:.
+                    "a" if b.skip == 0 => {
+                        let href = xml::attr(attrs, "href").map(xml::decode_entities);
+                        b.link = href
+                            .filter(|h| !h.is_empty() && !h.split('#').next().unwrap_or("").contains(':'))
+                            .map(|h| (h, b.chapter.blocks.len(), b.text.len()));
+                    }
                     _ => {}
                 }
             }
@@ -380,6 +403,16 @@ pub fn parse_xhtml(doc: &str, mut image: impl FnMut(&str) -> Option<Image>) -> C
                         b.lists.pop();
                     }
                     "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => b.heading = 0,
+                    // Kept if its text is still in the block it began in.
+                    "a" => {
+                        if let Some((href, block, start)) = b.link.take() {
+                            let text = b.text.get(start..).unwrap_or("");
+                            if block == b.chapter.blocks.len() && text.chars().any(|c| !c.is_whitespace()) {
+                                let (start, end) = (start as u32, b.text.trim_end().len() as u32);
+                                b.chapter.links.push(Link { block: block as u32, start, end, href });
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -407,6 +440,25 @@ mod tests {
         assert_eq!(c.blocks[1].style_at(10), 0);
         assert_eq!(c.blocks[2].kind, BlockKind::Rule);
         assert_eq!(c.blocks[3].text, "• a");
+    }
+
+    #[test]
+    fn links_inside_the_book() {
+        let c = parse_xhtml(
+            "<p>Pemberley<a href=\"notes.xhtml#n1\"><sup>1</sup></a> and \
+             <a href=\"https://example.com/\">a site</a>, see <a href=\"#ch2\">Chapter 2 </a>.</p>\
+             <p><a href=\"#empty\"> </a><a href=\"#x\">across<br/>lines</a></p>",
+            |_| None,
+        );
+        let links: Vec<_> = c
+            .links
+            .iter()
+            .map(|l| (l.block, &c.blocks[l.block as usize].text[l.start as usize..l.end as usize], l.href.as_str()))
+            .collect();
+        assert_eq!(
+            links,
+            [(0, "1", "notes.xhtml#n1"), (0, "Chapter 2", "#ch2"), (1, "across\nlines", "#x")]
+        );
     }
 
     #[test]

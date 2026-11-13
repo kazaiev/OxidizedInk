@@ -272,6 +272,17 @@ impl<F: ReadAt> Epub<F> {
         self.spine.iter().position(|s| s.path == path)
     }
 
+    /// Where a link in spine item `from` leads: a spine item, and the `id`
+    /// in it if the link names one. None if it leads out of the spine.
+    pub fn link_target(&self, from: usize, href: &str) -> Option<(usize, Option<String>)> {
+        let fragment = fragment_of(href);
+        if href.starts_with('#') {
+            return Some((from, fragment));
+        }
+        let base = dir_of(&self.spine.get(from)?.path);
+        Some((self.spine_index(&resolve(base, href))?, fragment))
+    }
+
     fn toc_entry(&self, base: &str, href: &str, title: &str, depth: u8) -> Option<TocEntry> {
         let title = clean_text(title);
         let spine = self.spine_index(&resolve(base, href))?;

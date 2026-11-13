@@ -34,7 +34,8 @@ const PINS: u16 = 1 << pin::PREV | 1 << pin::NEXT | 1 << pin::MENU;
 
 /// A shorter press is a bounce.
 const MIN_MS: u64 = 30;
-/// Holding Menu this long gives Back.
+/// Holding a button this long is a long press: Back for Menu, a chapter
+/// skip for Prev and Next.
 const LONG_MS: u64 = 600;
 
 /// Light sleep between presses (see `nap`). Turn it off to poll at full speed
@@ -73,8 +74,8 @@ impl Buttons {
     }
 
     /// Waits for a press and turns it into an input, or returns `None` after
-    /// `idle` without one: Prev, Next and Menu, and Back for a long press on
-    /// Menu.
+    /// `idle` without one: Prev, Next and Menu, and for long presses
+    /// SkipBack, SkipForward and Back.
     pub fn wait(&mut self, bus: &mut Bus, idle: Duration) -> Option<Input> {
         let delay = Delay::new();
         let start = Instant::now();
@@ -246,10 +247,13 @@ fn buttons_down(inputs: u16) -> u8 {
 }
 
 fn input(button: u8, held: u64) -> Input {
+    let long = held >= LONG_MS;
     match button {
+        PREV if long => Input::SkipBack,
         PREV => Input::Prev,
+        NEXT if long => Input::SkipForward,
         NEXT => Input::Next,
-        MENU if held < LONG_MS => Input::Menu,
-        _ => Input::Back,
+        MENU if long => Input::Back,
+        _ => Input::Menu,
     }
 }

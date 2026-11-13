@@ -19,7 +19,10 @@ use crate::settings::{Settings, SleepShows, StatusLine, SETTINGS, TEXT_SIZE};
 use crate::text::{Chapter, BOLD, ITALIC};
 use crate::{Error, ReadAt};
 
+mod bookmarks;
+mod footnotes;
 mod transfer;
+use bookmarks::Bookmark;
 pub use transfer::{Network, Wifi, WIFI_FILE};
 
 /// Portrait canvas size in pixels.
@@ -55,6 +58,8 @@ const BATTERY_ICON: (i32, i32) = (24, 12);
 /// author and progress.
 const COVER: (i32, i32) = (80, 120);
 const BOOK_ROW: i32 = 132;
+/// Height of a row in a plain list, such as the contents.
+const LIST_ROW: i32 = 44;
 /// Books whose covers the library keeps in memory, about two screens' worth.
 const SHELF: usize = 12;
 /// Starts a cover thumbnail file (`<book>.THM`), followed by the `COVER` box
@@ -87,6 +92,12 @@ pub enum Input {
     Menu,
     /// Leaves a menu or list.
     Back,
+    /// Holding Prev: back to the chapter's start (or the previous one's)
+    /// while reading, a screen up in long lists, Prev elsewhere.
+    SkipBack,
+    /// Holding Next: the next chapter while reading, a screen down in long
+    /// lists, Next elsewhere.
+    SkipForward,
 }
 
 /// Book files and small state files. On the device both live on the SD card
@@ -135,6 +146,11 @@ enum Screen {
     Reading,
     Menu { sel: usize },
     Toc { sel: usize },
+    /// Choosing a place in the book to go to, in percent.
+    GoTo { percent: u32 },
+    Bookmarks { sel: usize },
+    /// The links on the page.
+    Footnotes { sel: usize },
     /// `from_reading`: opened from the reading menu rather than the library.
     Settings { sel: usize, from_reading: bool },
     System { from_reading: bool },
@@ -149,7 +165,55 @@ const TOOLS: [(&str, &str); 3] = [
     ("System info", "Battery, card and memory"),
 ];
 
-const MENU: [&str; 7] = ["Back to book", "Contents", "Larger text", "Smaller text", "Settings", "System info", "Library"];
+/// The reading menu's items, in order.
+#[derive(Clone, Copy, PartialEq)]
+enum MenuItem {
+    BackToBook,
+    /// "Add bookmark", or "Remove bookmark" on a bookmarked page.
+    Bookmark,
+    Bookmarks,
+    /// Only on a page with links.
+    Footnotes,
+    Contents,
+    GoTo,
+    Larger,
+    Smaller,
+    Settings,
+    System,
+    Library,
+}
+
+const MENU: [MenuItem; 11] = [
+    MenuItem::BackToBook,
+    MenuItem::Bookmark,
+    MenuItem::Bookmarks,
+    MenuItem::Footnotes,
+    MenuItem::Contents,
+    MenuItem::GoTo,
+    MenuItem::Larger,
+    MenuItem::Smaller,
+    MenuItem::Settings,
+    MenuItem::System,
+    MenuItem::Library,
+];
+
+impl MenuItem {
+    fn label(self) -> &'static str {
+        match self {
+            MenuItem::BackToBook => "Back to book",
+            MenuItem::Bookmark => "Add bookmark",
+            MenuItem::Bookmarks => "Bookmarks",
+            MenuItem::Footnotes => "Footnotes",
+            MenuItem::Contents => "Contents",
+            MenuItem::GoTo => "Go to %",
+            MenuItem::Larger => "Larger text",
+            MenuItem::Smaller => "Smaller text",
+            MenuItem::Settings => "Settings",
+            MenuItem::System => "System info",
+            MenuItem::Library => "Library",
+        }
+    }
+}
 
 /// Where to land when entering a chapter.
 #[derive(Clone, Copy)]
@@ -197,6 +261,21 @@ struct Reader<F: ReadAt> {
     pictures: Vec<Picture>,
     /// Hyphenation patterns for the book's language.
     lang: Option<Lang>,
+    /// In reading order.
+    bookmarks: Vec<Bookmark>,
+    /// Set while away from the text at a link's target.
+    away: Option<Away>,
+}
+
+/// A visit to where a link leads, away from the text.
+#[derive(Clone, Copy)]
+struct Away {
+    /// The place in the text to go back to, and its percent.
+    spine: usize,
+    pos: Pos,
+    percent: u32,
+    /// The block the link led to, `(spine, block)`, marked in the margin.
+    target: Option<(usize, usize)>,
 }
 
 impl<F: ReadAt> Reader<F> {
@@ -297,6 +376,47 @@ impl<F: ReadAt> Reader<F> {
         self.pictures[at].gray.as_ref()
     }
 
+    /// Moves to the next chapter's first page, or (going back) to the
+    /// current chapter's first page, or the previous chapter's from there.
+    /// Chapters are TOC entries; before the first or after the last, and in
+    /// books without a TOC, spine items. Returns false at the book's ends.
+    fn skip_chapter(&mut self, layout: &Layout, forward: bool) -> bool {
+        // TOC entries in this spine item, on pages before or after this one.
+        let pages = self.marks.iter().map(|&(_, b)| page_of(&self.starts, Pos::new(b, 0)));
+        let here = if forward {
+            pages.filter(|&p| p > self.page).min()
+        } else {
+            pages.filter(|&p| p < self.page).max()
+        };
+        if let Some(p) = here {
+            self.page = p;
+            return true;
+        }
+        // The nearest spine item before or after with TOC entries.
+        let spines = self.epub.toc.iter().map(|e| e.spine);
+        let spine = if forward {
+            spines.filter(|&s| s > self.spine).min()
+        } else {
+            spines.filter(|&s| s < self.spine).max()
+        };
+        match spine {
+            Some(s) => {
+                if !self.goto(layout, s, Target::First) {
+                    return false;
+                }
+                let pages = self.marks.iter().map(|&(_, b)| page_of(&self.starts, Pos::new(b, 0)));
+                self.page = if forward { pages.min() } else { pages.max() }.unwrap_or(0);
+                true
+            }
+            None if forward => self.goto(layout, self.spine + 1, Target::First),
+            None if self.page > 0 => {
+                self.page = 0;
+                true
+            }
+            None => self.spine > 0 && self.goto(layout, self.spine - 1, Target::First),
+        }
+    }
+
     /// Index of the TOC entry the current page is in.
     fn toc_index(&self) -> Option<usize> {
         let block = self.pos().block as usize;
@@ -306,10 +426,37 @@ impl<F: ReadAt> Reader<F> {
 
     /// Overall progress through the book in percent, by spine item sizes.
     fn percent(&self) -> u32 {
+        self.percent_at(self.page)
+    }
+
+    /// `percent` at page `page` of the current spine item.
+    fn percent_at(&self, page: usize) -> u32 {
         let total = self.epub.total_size().max(1);
         let size = self.epub.spine[self.spine].size.max(1) as u64;
-        let done = self.epub.size_before(self.spine) + size * self.page as u64 / self.starts.len() as u64;
+        let done = self.epub.size_before(self.spine) + size * page as u64 / self.starts.len() as u64;
         (done * 100 / total) as u32
+    }
+
+    /// Moves to the first page at `percent` or later, as `percent` measures
+    /// it, or to the last page of the spine item `percent` falls in.
+    fn goto_percent(&mut self, layout: &Layout, percent: u32) -> bool {
+        let total = self.epub.total_size().max(1);
+        let target = (total * percent.min(100) as u64).div_ceil(100);
+        let (mut spine, mut before) = (0, 0);
+        while spine + 1 < self.epub.spine.len() {
+            let size = self.epub.spine[spine].size.max(1) as u64;
+            if before + size > target {
+                break;
+            }
+            before += size;
+            spine += 1;
+        }
+        if spine != self.spine && !self.goto(layout, spine, Target::First) {
+            return false;
+        }
+        let last = self.starts.len() - 1;
+        self.page = (0..=last).find(|&p| self.percent_at(p) >= percent).unwrap_or(last);
+        true
     }
 }
 
@@ -414,6 +561,16 @@ pub fn draw_logo(canvas: &mut Canvas) {
 /// number.
 fn rows_per_page(row_h: i32) -> usize {
     ((STATUS_BASELINE - 30 - LIST_TOP) / row_h).max(1) as usize
+}
+
+/// The row a screen up or down from `sel` in a list of `n` rows, `per_page`
+/// a screen; stops at the ends.
+fn skip_rows(sel: usize, n: usize, per_page: usize, forward: bool) -> usize {
+    if forward {
+        (sel + per_page).min(n.saturating_sub(1))
+    } else {
+        sel.saturating_sub(per_page)
+    }
 }
 
 /// Breaks `s` at spaces into at most `lines` lines of `max` pixels, the
@@ -607,6 +764,7 @@ impl<S: Storage> App<S> {
             _ => (0, Pos::default()),
         };
         let lang = hyphen::lang(&epub.language);
+        let bookmarks = self.storage.load(&book_file(&info, "BMK")).map(|d| bookmarks::parse(&d)).unwrap_or_default();
         let mut reader = Reader {
             info,
             epub,
@@ -617,6 +775,8 @@ impl<S: Storage> App<S> {
             marks: Vec::new(),
             pictures: Vec::new(),
             lang,
+            bookmarks,
+            away: None,
         };
         let layout = layout(&self.fonts, &self.settings, lang);
         let spine = if spine < reader.epub.spine.len() { spine } else { 0 };
@@ -630,17 +790,24 @@ impl<S: Storage> App<S> {
         self.save_progress();
     }
 
+    /// Saves the place reached, or the place in the text while away from it
+    /// at a link's target.
     fn save_progress(&mut self) {
         if let Some(r) = &self.reader {
-            let p = r.pos();
-            let percent = r.percent();
-            let s = format!("{} {} {} {}\n", r.spine, p.block, p.byte, percent);
+            let (spine, p, percent) = r.away.map_or((r.spine, r.pos(), r.percent()), |a| (a.spine, a.pos, a.percent));
+            let s = format!("{} {} {} {}\n", spine, p.block, p.byte, percent);
             let key = book_file(&r.info, "POS");
             let _ = self.storage.save(&key, s.as_bytes());
             if let Some(b) = self.shelf.iter_mut().find(|b| b.key == key) {
                 b.percent = Some(percent);
             }
         }
+    }
+
+    /// The reading menu's items for the current page.
+    fn menu(&self) -> Vec<MenuItem> {
+        let links = self.reader.as_ref().is_some_and(|r| !r.links_here().is_empty());
+        MENU.into_iter().filter(|&item| item != MenuItem::Footnotes || links).collect()
     }
 
     /// The open book's hyphenation patterns.
@@ -681,15 +848,20 @@ impl<S: Storage> App<S> {
                 let input = match input {
                     Input::Prev if self.settings.swap_page_buttons() => Input::Next,
                     Input::Next if self.settings.swap_page_buttons() => Input::Prev,
+                    Input::SkipBack if self.settings.swap_page_buttons() => Input::SkipForward,
+                    Input::SkipForward if self.settings.swap_page_buttons() => Input::SkipBack,
                     i => i,
                 };
                 let moved = match input {
                     Input::Next => r.next_page(&layout),
                     Input::Prev => r.prev_page(&layout),
+                    Input::SkipForward => r.skip_chapter(&layout, true),
+                    Input::SkipBack => r.skip_chapter(&layout, false),
                     Input::Menu => {
                         self.screen = Screen::Menu { sel: 0 };
                         return true;
                     }
+                    Input::Back if r.away.is_some() => r.go_back(&layout),
                     Input::Back => {
                         let sel = self.library.iter().position(|b| b.file == r.info.file).unwrap_or(0);
                         self.screen = Screen::Library { sel };
@@ -702,24 +874,64 @@ impl<S: Storage> App<S> {
                 moved
             }
             Screen::Menu { sel } => {
+                let menu = self.menu();
+                let n = menu.len();
                 match input {
-                    Input::Prev => self.screen = Screen::Menu { sel: (sel + MENU.len() - 1) % MENU.len() },
-                    Input::Next => self.screen = Screen::Menu { sel: (sel + 1) % MENU.len() },
+                    Input::Prev | Input::SkipBack => self.screen = Screen::Menu { sel: (sel + n - 1) % n },
+                    Input::Next | Input::SkipForward => self.screen = Screen::Menu { sel: (sel + 1) % n },
                     Input::Back => self.screen = Screen::Reading,
-                    Input::Menu => match sel {
-                        1 => {
+                    Input::Menu => match menu[sel.min(n - 1)] {
+                        MenuItem::BackToBook => self.screen = Screen::Reading,
+                        MenuItem::Footnotes => self.open_footnotes(),
+                        MenuItem::Bookmark => {
+                            self.toggle_bookmark();
+                            self.screen = Screen::Reading;
+                        }
+                        MenuItem::Bookmarks => {
+                            // Start at the bookmark on or before this page.
+                            let sel = self.reader.as_ref().map_or(0, |r| {
+                                let here = (r.spine, r.pos());
+                                r.bookmarks.partition_point(|b| (b.spine, b.pos) <= here).saturating_sub(1)
+                            });
+                            self.screen = Screen::Bookmarks { sel };
+                        }
+                        MenuItem::Contents => {
                             let sel = self.reader.as_ref().and_then(|r| r.toc_index()).unwrap_or(0);
                             self.screen = Screen::Toc { sel };
                         }
-                        2 | 3 => {
-                            self.set_font(if sel == 2 { 1 } else { -1 });
+                        MenuItem::GoTo => {
+                            let percent = self.reader.as_ref().map_or(0, |r| r.percent());
+                            self.screen = Screen::GoTo { percent };
+                        }
+                        item @ (MenuItem::Larger | MenuItem::Smaller) => {
+                            self.set_font(if item == MenuItem::Larger { 1 } else { -1 });
                             self.screen = Screen::Reading;
                         }
-                        4 => self.screen = Screen::Settings { sel: 0, from_reading: true },
-                        5 => self.screen = Screen::System { from_reading: true },
-                        6 => return self.show_library(),
-                        _ => self.screen = Screen::Reading,
+                        MenuItem::Settings => self.screen = Screen::Settings { sel: 0, from_reading: true },
+                        MenuItem::System => self.screen = Screen::System { from_reading: true },
+                        MenuItem::Library => return self.show_library(),
                     },
+                }
+                true
+            }
+            Screen::Bookmarks { sel } => self.handle_bookmarks(input, sel),
+            Screen::Footnotes { sel } => self.handle_footnotes(input, sel),
+            Screen::GoTo { percent } => {
+                let step = |d: i32| Screen::GoTo { percent: (percent as i32 + d).clamp(0, 100) as u32 };
+                match input {
+                    Input::Prev => self.screen = step(-1),
+                    Input::Next => self.screen = step(1),
+                    Input::SkipBack => self.screen = step(-10),
+                    Input::SkipForward => self.screen = step(10),
+                    Input::Back => self.screen = Screen::Reading,
+                    Input::Menu => {
+                        if let Some(r) = &mut self.reader {
+                            r.away = None;
+                            r.goto_percent(&layout, percent);
+                        }
+                        self.save_progress();
+                        self.screen = Screen::Reading;
+                    }
                 }
                 true
             }
@@ -733,8 +945,13 @@ impl<S: Storage> App<S> {
                 match input {
                     Input::Prev => self.screen = Screen::Toc { sel: (sel + n - 1) % n },
                     Input::Next => self.screen = Screen::Toc { sel: (sel + 1) % n },
+                    Input::SkipBack | Input::SkipForward => {
+                        let forward = input == Input::SkipForward;
+                        self.screen = Screen::Toc { sel: skip_rows(sel, n, rows_per_page(LIST_ROW), forward) };
+                    }
                     Input::Back => self.screen = Screen::Reading,
                     Input::Menu => {
+                        r.away = None;
                         let e = r.epub.toc[sel].clone();
                         if e.spine != r.spine {
                             r.goto(&layout, e.spine, Target::First);
@@ -757,6 +974,10 @@ impl<S: Storage> App<S> {
                 match input {
                     Input::Prev => self.screen = Screen::Library { sel: (sel + n - 1) % n },
                     Input::Next => self.screen = Screen::Library { sel: (sel + 1) % n },
+                    Input::SkipBack | Input::SkipForward => {
+                        let forward = input == Input::SkipForward;
+                        self.screen = Screen::Library { sel: skip_rows(sel, n, rows_per_page(BOOK_ROW), forward) };
+                    }
                     Input::Menu if sel < books => self.open_book(sel),
                     Input::Menu => match sel - books {
                         0 => self.open_transfer(),
@@ -771,8 +992,10 @@ impl<S: Storage> App<S> {
             Screen::Settings { sel, from_reading } => {
                 let n = SETTINGS.len();
                 match input {
-                    Input::Prev => self.screen = Screen::Settings { sel: (sel + n - 1) % n, from_reading },
-                    Input::Next => self.screen = Screen::Settings { sel: (sel + 1) % n, from_reading },
+                    Input::Prev | Input::SkipBack => {
+                        self.screen = Screen::Settings { sel: (sel + n - 1) % n, from_reading }
+                    }
+                    Input::Next | Input::SkipForward => self.screen = Screen::Settings { sel: (sel + 1) % n, from_reading },
                     Input::Menu => {
                         self.settings.cycle(sel);
                         self.save_settings();
@@ -867,6 +1090,9 @@ impl<S: Storage> App<S> {
                 self.draw_menu(canvas, sel);
             }
             Screen::Toc { sel } => self.draw_toc(canvas, sel),
+            Screen::GoTo { percent } => self.draw_goto(canvas, percent),
+            Screen::Bookmarks { sel } => self.draw_bookmarks(canvas, sel),
+            Screen::Footnotes { sel } => self.draw_footnotes(canvas, sel),
             Screen::Library { sel } => self.draw_library(canvas, sel),
             Screen::Settings { sel, .. } => self.draw_settings(canvas, sel),
             Screen::System { .. } => self.draw_system(canvas),
@@ -957,6 +1183,10 @@ impl<S: Storage> App<S> {
             }
         }
         let side = layout.left;
+        if r.bookmark_here().is_some() {
+            bookmarks::draw_ribbon(canvas, side);
+        }
+        footnotes::mark_target(canvas, r, &page, side);
         self.draw_status(canvas, side);
     }
 
@@ -973,9 +1203,12 @@ impl<S: Storage> App<S> {
         let battery = self.status_battery;
         let battery_text = battery.map(|b| format!("{}%", b));
         let battery_w = battery_text.as_ref().map_or(0, |t| BATTERY_ICON.0 + 6 + self.width(0, STATUS_PX, t) + 20);
-        let title = r.toc_index().map(|i| r.epub.toc[i].title.as_str()).unwrap_or(&r.info.title);
+        let title = match r.away {
+            Some(_) => "Hold Menu: back to the text",
+            None => r.toc_index().map(|i| r.epub.toc[i].title.as_str()).unwrap_or(&r.info.title),
+        };
         let title = fit(&self.fonts, ITALIC, STATUS_PX, title, WIDTH - 2 * side - right_w - battery_w - 24);
-        if status == StatusLine::Full {
+        if status == StatusLine::Full || r.away.is_some() {
             self.text(canvas, ITALIC, STATUS_PX, side, STATUS_BASELINE, &title);
         }
         self.text(canvas, 0, STATUS_PX, WIDTH - side - right_w, STATUS_BASELINE, &right);
@@ -989,7 +1222,8 @@ impl<S: Storage> App<S> {
     fn draw_menu(&mut self, canvas: &mut Canvas, sel: usize) {
         let row = 48;
         let (x, w) = (60, WIDTH - 120);
-        let h = 56 + row * MENU.len() as i32 + 16;
+        let menu = self.menu();
+        let h = 56 + row * menu.len() as i32 + 16;
         let y = HEIGHT - h - 60;
         canvas.fill_rect(x - 3, y - 3, w + 6, h + 6, BLACK);
         canvas.fill_rect(x, y, w, h, WHITE);
@@ -998,9 +1232,11 @@ impl<S: Storage> App<S> {
             info.push_str(&format!("  ·  Battery {}%", b));
         }
         self.text(canvas, ITALIC, 18, x + 24, y + 36, &info);
-        for (i, item) in MENU.iter().enumerate() {
+        let marked = self.reader.as_ref().is_some_and(|r| r.bookmark_here().is_some());
+        for (i, &item) in menu.iter().enumerate() {
             let top = y + 56 + row * i as i32;
-            self.text(canvas, 0, 24, x + 24, top + 32, item);
+            let label = if item == MenuItem::Bookmark && marked { "Remove bookmark" } else { item.label() };
+            self.text(canvas, 0, 24, x + 24, top + 32, label);
             if i == sel {
                 canvas.invert_rect(x + 8, top + 2, w - 16, row - 4);
             }
@@ -1016,7 +1252,7 @@ impl<S: Storage> App<S> {
     /// `(text, depth)`.
     fn draw_list(&mut self, canvas: &mut Canvas, title: &str, rows: &[(String, u8)], sel: usize) {
         self.draw_header(canvas, title);
-        let row_h = 44;
+        let row_h = LIST_ROW;
         let per_page = rows_per_page(row_h);
         let first = sel / per_page * per_page;
         for (k, (text, depth)) in rows.iter().enumerate().skip(first).take(per_page) {
@@ -1191,6 +1427,23 @@ impl<S: Storage> App<S> {
     }
 
     /// A centred line of help at the bottom of the screen.
+    /// The percentage being chosen, large, over a bar for the book with a
+    /// tick where the reader is now.
+    fn draw_goto(&mut self, canvas: &mut Canvas, percent: u32) {
+        let Some(now) = self.reader.as_ref().map(|r| r.percent()) else { return };
+        self.draw_header(canvas, "Go to");
+        self.centered(canvas, BOLD, 96, 330, &format!("{percent}%"));
+        let (x, w, y, h) = (MARGIN_X + 12, WIDTH - 2 * MARGIN_X - 24, 400, 28);
+        canvas.fill_rect(x, y, w, h, BLACK);
+        canvas.fill_rect(x + 3, y + 3, w - 6, h - 6, WHITE);
+        canvas.fill_rect(x + 3, y + 3, (w - 6) * percent as i32 / 100, h - 6, BLACK);
+        let tick = x + 3 + (w - 6) * now as i32 / 100;
+        canvas.fill_rect(tick - 1, y + h + 6, 3, 16, BLACK);
+        self.centered(canvas, ITALIC, 22, y + h + 60, &format!("Now at {now}%"));
+        self.centered(canvas, 0, STATUS_PX, STATUS_BASELINE - 34, "Prev, Next: 1%    Hold: 10%");
+        self.draw_hint(canvas, "Menu: go    Hold Menu: back");
+    }
+
     fn draw_hint(&mut self, canvas: &mut Canvas, hint: &str) {
         self.centered(canvas, 0, STATUS_PX, STATUS_BASELINE, hint);
     }
