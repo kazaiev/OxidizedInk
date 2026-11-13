@@ -1230,6 +1230,7 @@ dependencies = [
  "hypher",
  "libm",
  "miniz_oxide",
+ "ttf-parser",
 ]
 
 [[package]]

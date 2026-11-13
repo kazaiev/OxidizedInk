@@ -24,7 +24,7 @@ https://alex.k4zka.online/projects/oxidized-ink/) for the full plan and status.
 | `sim/` | PC simulator that runs `core` in a window, or headless writing PNGs |
 | `firmware/` | ESP32 firmware for the Inkplate 6 V2 (esp-hal): panel driver, SD card, input, deep sleep. `bringup` is a separate test program |
 | `case/` | OpenSCAD case with a button strip and room for a 606090 cell (see `case/README.md`) |
-| `fonts/` | PT Serif, SIL Open Font License (see `fonts/OFL.txt`) |
+| `fonts/` | Literata, SIL Open Font License (see `fonts/OFL.txt`) |
 | `docs/HARDWARE.md` | Inkplate 6 hardware notes, from Soldered's Arduino library |
 
 ## Firmware

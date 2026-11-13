@@ -7,6 +7,9 @@ description = "Platform-independent e-reader logic: EPUB parsing, layout, render
 [dependencies]
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
 ab_glyph = { version = "0.2", default-features = false, features = ["libm"] }
+# The same ttf-parser ab_glyph uses, for kerning from GPOS, which ab_glyph
+# doesn't read.
+ttf-parser = { version = "0.25", default-features = false, features = ["opentype-layout", "no-std-float"] }
 libm = "0.2"
 # English and Ukrainian patterns, about 48 KB. Each language is a feature.
 hypher = { version = "0.1.8", default-features = false, features = ["alloc", "english", "ukrainian"] }

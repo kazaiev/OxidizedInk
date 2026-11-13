@@ -1,16 +1,22 @@
-//! The four embedded PT Serif faces, indexed by style bits (`text::BOLD`,
+//! The four embedded Literata faces, indexed by style bits (`text::BOLD`,
 //! `text::ITALIC`), with glyph ids and advance widths cached for common
 //! characters. Widths are in font units; `Fonts::units_per_em` converts.
 
 use ab_glyph::{Font, FontRef, GlyphId, PxScale};
 use alloc::vec::Vec;
+use core::cell::Cell;
+use ttf_parser::gpos::{PairAdjustment, PositioningSubtable};
 
 const DATA: [&[u8]; 4] = [
-    include_bytes!("../../fonts/PT_Serif-Web-Regular.ttf"),
-    include_bytes!("../../fonts/PT_Serif-Web-Bold.ttf"),
-    include_bytes!("../../fonts/PT_Serif-Web-Italic.ttf"),
-    include_bytes!("../../fonts/PT_Serif-Web-BoldItalic.ttf"),
+    include_bytes!("../../fonts/Literata-Regular.ttf"),
+    include_bytes!("../../fonts/Literata-Bold.ttf"),
+    include_bytes!("../../fonts/Literata-Italic.ttf"),
+    include_bytes!("../../fonts/Literata-BoldItalic.ttf"),
 ];
+
+/// Kerning lookups remembered, a power of two. Text uses the same pairs
+/// over and over, and a GPOS lookup costs several binary searches.
+const KERN_CACHE: usize = 4096;
 
 /// Cached characters: U+0000..U+04FF (Latin, Greek, Cyrillic) and the
 /// General Punctuation block (quotes, dashes, ellipsis).
@@ -31,7 +37,7 @@ pub fn is_invisible(c: char) -> bool {
     matches!(c, '\u{ad}' | '\u{200b}'..='\u{200d}' | '\u{2060}' | '\u{feff}')
 }
 
-/// Stand-ins for characters PT Serif lacks.
+/// Stand-ins for characters the font may lack.
 fn substitute(c: char) -> char {
     match c {
         '\t' | '\u{2000}'..='\u{200a}' | '\u{202f}' | '\u{205f}' => ' ',
@@ -42,8 +48,61 @@ fn substitute(c: char) -> char {
     }
 }
 
+/// A face's pair kerning, from its GPOS `kern` feature. Fonts made today
+/// keep kerning there rather than in the old `kern` table, the only one
+/// ab_glyph reads.
+struct Kerning {
+    /// The `kern` feature's pair-adjustment subtables, by lookup in order.
+    lookups: Vec<Vec<PairAdjustment<'static>>>,
+}
+
+impl Kerning {
+    fn new(data: &'static [u8]) -> Kerning {
+        let gpos = ttf_parser::Face::parse(data, 0).ok().and_then(|f| f.tables().gpos);
+        let Some(gpos) = gpos else { return Kerning { lookups: Vec::new() } };
+        let kern = ttf_parser::Tag::from_bytes(b"kern");
+        let mut indices: Vec<u16> =
+            gpos.features.into_iter().filter(|f| f.tag == kern).flat_map(|f| f.lookup_indices).collect();
+        indices.sort_unstable();
+        indices.dedup();
+        let lookups = indices
+            .into_iter()
+            .filter_map(|i| gpos.lookups.get(i))
+            .map(|l| {
+                let subtables = l.subtables.into_iter::<PositioningSubtable>();
+                subtables.filter_map(|s| if let PositioningSubtable::Pair(p) = s { Some(p) } else { None }).collect()
+            })
+            .collect();
+        Kerning { lookups }
+    }
+
+    /// The adjustment between glyphs `a` and `b`, in font units: each
+    /// lookup's first subtable that has the pair.
+    fn pair(&self, a: GlyphId, b: GlyphId) -> i32 {
+        let (a, b) = (ttf_parser::GlyphId(a.0), ttf_parser::GlyphId(b.0));
+        let mut total = 0;
+        for subtables in &self.lookups {
+            let found = subtables.iter().find_map(|p| match p {
+                PairAdjustment::Format1 { coverage, sets } => sets.get(coverage.get(a)?)?.get(b),
+                PairAdjustment::Format2 { coverage, classes, matrix } => {
+                    coverage.get(a)?;
+                    matrix.get((classes.0.get(a), classes.1.get(b)))
+                }
+            });
+            if let Some((first, _)) = found {
+                total += first.x_advance as i32;
+            }
+        }
+        total
+    }
+}
+
 pub struct Fonts {
     faces: [FontRef<'static>; 4],
+    kerning: [Kerning; 4],
+    /// Recent GPOS kerning lookups, by a hash of the face and glyphs: the
+    /// key plus one (0 is empty) above the value's 16 bits.
+    kern_cache: Vec<Cell<u64>>,
     /// `(glyph id, advance)` for each face and cached character.
     cache: Vec<(u16, u16)>,
     pub units_per_em: i32,
@@ -58,6 +117,8 @@ impl Fonts {
         let faces = DATA.map(|d| FontRef::try_from_slice(d).expect("embedded font"));
         let f = &faces[0];
         let mut fonts = Fonts {
+            kerning: DATA.map(Kerning::new),
+            kern_cache: (0..KERN_CACHE).map(|_| Cell::new(0)).collect(),
             units_per_em: f.units_per_em().unwrap_or(1000.0) as i32,
             ascent: f.ascent_unscaled() as i32,
             descent: -f.descent_unscaled() as i32,
@@ -102,8 +163,21 @@ impl Fonts {
         }
     }
 
+    /// Kerning between `a` and `b`, from GPOS, or else the old `kern` table.
     pub fn kern(&self, face: u8, a: GlyphId, b: GlyphId) -> i32 {
-        self.faces[(face & 3) as usize].kern_unscaled(a, b) as i32
+        let face = (face & 3) as usize;
+        if self.kerning[face].lookups.is_empty() {
+            return self.faces[face].kern_unscaled(a, b) as i32;
+        }
+        let key = ((face as u64) << 32 | (a.0 as u64) << 16 | b.0 as u64) + 1;
+        let hash = key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - KERN_CACHE.trailing_zeros());
+        let slot = &self.kern_cache[hash as usize];
+        if slot.get() >> 16 == key {
+            return slot.get() as u16 as i16 as i32;
+        }
+        let kern = self.kerning[face].pair(a, b);
+        slot.set(key << 16 | kern as i16 as u16 as u64);
+        kern
     }
 
     pub fn face(&self, face: u8) -> &FontRef<'static> {
@@ -196,3 +270,4 @@ mod tests {
         assert_eq!(f.measure(0, "A\u{ad}V"), f.measure(0, "AV"));
     }
 }
+

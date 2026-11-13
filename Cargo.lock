@@ -261,6 +261,7 @@ dependencies = [
  "libm",
  "miniz_oxide 0.8.9",
  "png",
+ "ttf-parser",
 ]
 
 [[package]]
