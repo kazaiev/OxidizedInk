@@ -37,13 +37,19 @@ button:hover { border-color: var(--bad); color: var(--bad); }
 <main>
 <h1>Oxidized<span>Ink</span></h1>
 <div id="drop" tabindex="0">
-  <p><strong>Drop .epub files here</strong></p>
+  <p><strong>Drop books (.epub) or fonts (.ttf, .otf) here</strong></p>
   <p class="mute">or click to choose them</p>
-  <input id="pick" type="file" accept=".epub,application/epub+zip" multiple hidden>
+  <input id="pick" type="file" accept=".epub,application/epub+zip,.ttf,.otf" multiple hidden>
 </div>
 <ul id="queue"></ul>
 <h2 id="count">Books</h2>
 <ul id="books"></ul>
+<h2>Firmware</h2>
+<ul><li><div><b id="version">…</b><i>Send an update (a .bin from espflash save-image): the reader checks it, restarts and installs it, which takes about half a minute.</i></div><button id="update">Update</button></li></ul>
+<input id="pickbin" type="file" accept=".bin" hidden>
+<h2>Fonts</h2>
+<p class="mute">Send a family's regular, bold, italic and bold italic files together, up to 1200 KB in all. Pick it on the reader under Settings, Font.</p>
+<ul id="fonts"></ul>
 </main>
 <script>
 const $ = (s) => document.querySelector(s);
@@ -72,19 +78,108 @@ async function load() {
   }));
 }
 
+const STYLE_NAMES = { REGULAR: 'Regular', BOLD: 'Bold', ITALIC: 'Italic', BOLDITAL: 'Bold italic', Regular: 'Regular', Bold: 'Bold', Italic: 'Italic', BoldItalic: 'Bold italic' };
+const MAX_FAMILY = 1200 * 1024;
+
+async function loadFonts() {
+  const fonts = await (await fetch('/fonts')).json();
+  if (!fonts.length) { $('#fonts').replaceChildren(el('li', 'No fonts yet: books use Literata, built in.', 'mute')); return; }
+  $('#fonts').replaceChildren(...fonts.map((f) => {
+    const li = el('li'), text = el('div');
+    const styles = f.files.map((x) => STYLE_NAMES[x.style]).filter(Boolean).join(', ');
+    const total = f.files.reduce((n, x) => n + x.size, 0);
+    text.append(el('b', f.family), el('i', [styles, size(total), f.current ? 'used for books' : ''].filter(Boolean).join(' · ')));
+    const del = el('button', 'Delete');
+    del.onclick = async () => {
+      if (!confirm('Delete the font ' + f.family + ' from the reader?')) return;
+      del.disabled = true;
+      const r = await fetch('/fonts/' + encodeURIComponent(f.family), { method: 'DELETE' });
+      if (!r.ok) alert(await r.text());
+      loadFonts();
+    };
+    li.append(text, del);
+    return li;
+  }));
+}
+
+// A font file's family name (name table, ID 16, else 1) and its style
+// (OS/2 weight and italic and bold flags).
+function fontInfo(buf) {
+  const v = new DataView(buf);
+  const tables = {};
+  for (let i = 0, n = v.getUint16(4); i < n; i++) {
+    const o = 12 + i * 16;
+    tables[String.fromCharCode(v.getUint8(o), v.getUint8(o + 1), v.getUint8(o + 2), v.getUint8(o + 3))] = v.getUint32(o + 8);
+  }
+  let weight = 400, italic = false, bold = false;
+  if ('OS/2' in tables) {
+    const t = tables['OS/2'];
+    weight = v.getUint16(t + 4);
+    const sel = v.getUint16(t + 62);
+    italic = (sel & 1) !== 0; bold = (sel & 32) !== 0;
+  }
+  const names = {};
+  if ('name' in tables) {
+    const t = tables.name, strings = t + v.getUint16(t + 4);
+    for (let i = 0, n = v.getUint16(t + 2); i < n; i++) {
+      const r = t + 6 + i * 12, platform = v.getUint16(r), id = v.getUint16(r + 6), len = v.getUint16(r + 8), off = v.getUint16(r + 10);
+      if ((id === 1 || id === 16) && (platform === 0 || platform === 3) && !names[id]) {
+        let s = '';
+        for (let k = 0; k < len; k += 2) s += String.fromCharCode(v.getUint16(strings + off + k));
+        names[id] = s.trim();
+      }
+    }
+  }
+  bold = bold || weight >= 600;
+  return { family: names[16] || names[1] || '', weight, style: italic ? (bold ? 'BOLDITAL' : 'ITALIC') : (bold ? 'BOLD' : 'REGULAR') };
+}
+
 // The reader takes one upload at a time.
 const todo = [];
 let busy = false;
 
-function add(files) {
+function row(name) {
+  const li = el('li'), text = el('div'), bar = el('progress'), note = el('i', 'Waiting');
+  bar.max = 1; bar.value = 0;
+  text.append(el('b', name), bar, note);
+  li.append(text);
+  $('#queue').append(li);
+  return { bar, note };
+}
+
+function fail(note, text) { note.textContent = text; note.className = 'bad'; }
+
+async function add(files) {
+  const fonts = [];
   for (const f of files) {
-    const li = el('li'), text = el('div'), bar = el('progress'), note = el('i', 'Waiting');
-    bar.max = 1; bar.value = 0;
-    text.append(el('b', f.name), bar, note);
-    li.append(text);
-    $('#queue').append(li);
-    if (!/\.epub$/i.test(f.name)) { note.textContent = 'Not an .epub file'; note.className = 'bad'; continue; }
-    todo.push({ f, bar, note });
+    if (/\.(ttf|otf)$/i.test(f.name)) { fonts.push(f); continue; }
+    const { bar, note } = row(f.name);
+    if (!/\.epub$/i.test(f.name)) { fail(note, 'Not an .epub, .ttf or .otf file'); continue; }
+    todo.push({ f, bar, note, url: '/books/' + encodeURIComponent(f.name), sent: () => load() });
+  }
+  // Fonts: by family, the file for each style with the weight nearest to
+  // 400 (regular, italic) or 700 (bold).
+  const families = {};
+  for (const f of fonts) {
+    let info;
+    try { info = fontInfo(await f.arrayBuffer()); } catch (e) { info = { family: '' }; }
+    if (!info.family) { fail(row(f.name).note, 'Not a font this page can read'); continue; }
+    const fam = families[info.family] ||= {};
+    const target = info.style.startsWith('BOLD') ? 700 : 400;
+    const old = fam[info.style];
+    if (old && Math.abs(old.info.weight - target) <= Math.abs(info.weight - target)) { fail(row(f.name).note, 'Not used: another weight of ' + info.family); continue; }
+    if (old) fail(row(old.f.name).note, 'Not used: another weight of ' + info.family);
+    fam[info.style] = { f, info };
+  }
+  for (const [family, styles] of Object.entries(families)) {
+    const total = Object.values(styles).reduce((n, s) => n + s.f.size, 0);
+    for (const [style, { f }] of Object.entries(styles)) {
+      const { bar, note } = row(family + ', ' + STYLE_NAMES[style] + ' (' + f.name + ')');
+      if (!styles.REGULAR) { fail(note, 'No regular style among the files'); continue; }
+      if (total > MAX_FAMILY) { fail(note, 'The family is ' + size(total) + ', more than the reader can load'); continue; }
+      const ext = /\.otf$/i.test(f.name) ? 'OTF' : 'TTF';
+      todo.push({ f, bar, note, url: '/fonts/' + encodeURIComponent(family) + '/' + style + '.' + ext, sent: () => loadFonts() });
+    }
   }
   next();
 }
@@ -92,14 +187,14 @@ function add(files) {
 function next() {
   if (busy || !todo.length) return;
   busy = true;
-  const { f, bar, note } = todo.shift();
+  const { f, bar, note, url, sent } = todo.shift();
   note.textContent = 'Sending ' + size(f.size);
   const x = new XMLHttpRequest();
-  x.open('PUT', '/books/' + encodeURIComponent(f.name));
+  x.open('PUT', url);
   x.upload.onprogress = (e) => { if (e.lengthComputable) bar.value = e.loaded / e.total; };
   const done = (ok, text) => {
     note.textContent = text; note.className = ok ? '' : 'bad'; bar.value = ok ? 1 : bar.value;
-    busy = false; load(); next();
+    busy = false; sent(); next();
   };
   x.onload = () => x.status === 201 ? done(true, 'Sent') : done(false, x.responseText || 'Failed');
   x.onerror = () => done(false, 'Connection lost');
@@ -113,7 +208,26 @@ pick.onchange = () => { add(pick.files); pick.value = ''; };
 drop.ondragover = (e) => { e.preventDefault(); drop.classList.add('over'); };
 drop.ondragleave = () => drop.classList.remove('over');
 drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove('over'); add(e.dataTransfer.files); };
+async function loadVersion() {
+  const r = await (await fetch('/firmware')).json();
+  $('#version').textContent = 'Running ' + r.version;
+}
+
+$('#update').onclick = () => $('#pickbin').click();
+$('#pickbin').onchange = () => {
+  const f = $('#pickbin').files[0];
+  $('#pickbin').value = '';
+  if (!f) return;
+  const { bar, note } = row('Firmware update (' + f.name + ')');
+  todo.push({ f, bar, note, url: '/firmware', sent: () => {
+    if (note.className !== 'bad') note.textContent = 'Sent. The reader restarts to install it; its Wi-Fi page closes.';
+  } });
+  next();
+};
+
 load();
+loadFonts();
+loadVersion();
 </script>
 </body>
 </html>

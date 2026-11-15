@@ -18,6 +18,7 @@ extern crate alloc;
 
 mod expander;
 mod panel;
+mod heap;
 mod psram;
 mod sd;
 
@@ -55,6 +56,14 @@ const RTC: u8 = 0x51;
 #[no_mangle]
 fn custom_pre_backtrace() {
     panel::emergency_off();
+}
+
+/// Runs after a panic's backtrace: restarts after a moment, so a firmware
+/// that fails counts as a failed start (see `update`) instead of stopping.
+#[no_mangle]
+fn custom_halt() -> ! {
+    Delay::new().delay_millis(3000);
+    esp_hal::system::software_reset()
 }
 
 fn name(addr: u8) -> &'static str {
@@ -102,7 +111,7 @@ fn layout(fonts: &Fonts) -> Layout<'_> {
 fn benchmark_book(sd: &Sd, e: &Entry, fonts: &Fonts, canvas: &mut Canvas, renderer: &mut Renderer) {
     info!("{} ({} KB)", e.name(), e.size / 1024);
     let t = Instant::now();
-    let file = match sd.open("", &e.short) {
+    let file = match sd.open("", e.short) {
         Ok(f) => f,
         Err(err) => return warn!("  can't open: {:?}", err),
     };
@@ -192,7 +201,7 @@ struct Reader {
 
 impl Reader {
     fn open(sd: &Sd, e: &Entry) -> Option<Self> {
-        let file = sd.open("", &e.short).ok()?;
+        let file = sd.open("", e.short).ok()?;
         let epub = Epub::open(Book(file)).ok()?;
         Some(Reader { epub, spine: 0, chapter: Chapter::default(), starts: Vec::new(), page: 0 })
     }

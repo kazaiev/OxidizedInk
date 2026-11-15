@@ -120,6 +120,59 @@ impl Storage for DirStorage {
         let _ = fs::remove_file(self.state.join(name));
     }
 
+    fn list_fonts(&mut self) -> Vec<(String, Vec<(String, u64)>)> {
+        let font = |p: &Path| p.extension().and_then(|x| x.to_str()).is_some_and(|x| ["ttf", "otf"].contains(&x.to_ascii_lowercase().as_str()));
+        let mut out = Vec::new();
+        for folder in fs::read_dir(self.books.join("FONTS")).into_iter().flatten().flatten() {
+            let (Ok(name), true) = (folder.file_name().into_string(), folder.path().is_dir()) else { continue };
+            let mut files: Vec<_> = fs::read_dir(folder.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| font(&e.path()))
+                .filter_map(|e| Some((e.file_name().into_string().ok()?, e.metadata().ok()?.len())))
+                .collect();
+            files.sort();
+            if !files.is_empty() {
+                out.push((name, files));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn load_font(&mut self, family: &str, file: &str) -> Option<Vec<u8>> {
+        fs::read(self.books.join("FONTS").join(family).join(file)).ok()
+    }
+
+    fn create_firmware(&mut self) -> Result<FileUpload, Error> {
+        File::create(self.books.join("FIRMWARE.BIN")).map(FileUpload).map_err(|_| Error::Io)
+    }
+
+    fn read_firmware(&mut self, f: &mut dyn FnMut(&[u8])) -> Result<(), Error> {
+        f(&fs::read(self.books.join("FIRMWARE.BIN")).map_err(|_| Error::Io)?);
+        Ok(())
+    }
+
+    fn delete_firmware(&mut self) {
+        let _ = fs::remove_file(self.books.join("FIRMWARE.BIN"));
+    }
+
+    fn create_font(&mut self, family: &str, file: &str) -> Result<FileUpload, Error> {
+        let dir = self.books.join("FONTS").join(family);
+        fs::create_dir_all(&dir).map_err(|_| Error::Io)?;
+        File::create(dir.join(file)).map(FileUpload).map_err(|_| Error::Io)
+    }
+
+    fn delete_font(&mut self, family: &str, file: Option<&str>) -> Result<(), Error> {
+        let dir = self.books.join("FONTS").join(family);
+        match file {
+            Some(file) => fs::remove_file(dir.join(file)),
+            None => fs::remove_dir_all(dir),
+        }
+        .map_err(|_| Error::Io)
+    }
+
     fn list_pictures(&mut self) -> Vec<String> {
         let picture = |p: &Path| {
             p.extension().and_then(|x| x.to_str()).is_some_and(|x| ["jpg", "jpeg", "png"].contains(&x.to_ascii_lowercase().as_str()))
@@ -238,6 +291,7 @@ fn main() {
     }
     let state = state.unwrap_or_else(|| books.join("READER"));
     let mut app = App::new(DirStorage { books, state });
+    app.version = format!("simulator {}", env!("CARGO_PKG_VERSION"));
     app.system = vec![("Device".into(), "Simulator".into())];
     app.battery = battery;
     app.status_battery = battery;

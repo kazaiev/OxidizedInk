@@ -12,6 +12,8 @@ ab_glyph = { version = "0.2", default-features = false, features = ["libm"] }
 ttf-parser = { version = "0.25", default-features = false, features = ["opentype-layout", "no-std-float"] }
 libm = "0.2"
 # English and Ukrainian patterns, about 48 KB. Each language is a feature.
+# Checking firmware images before they're installed.
+sha2 = { version = "0.10", default-features = false }
 hypher = { version = "0.1.8", default-features = false, features = ["alloc", "english", "ukrainian"] }
 
 [dev-dependencies]

@@ -27,9 +27,11 @@ mod battery;
 mod buttons;
 mod expander;
 mod panel;
+mod heap;
 mod psram;
 mod sd;
 mod storage;
+mod update;
 mod wifi;
 
 use alloc::format;
@@ -93,6 +95,17 @@ const BOOT_FROM_WIFI: u8 = 0xc3;
 fn custom_pre_backtrace() {
     panel::emergency_off();
 }
+
+/// Runs after a panic's backtrace: restarts after a moment, so a firmware
+/// that fails counts as a failed start (see `update`) instead of stopping.
+#[no_mangle]
+fn custom_halt() -> ! {
+    Delay::new().delay_millis(3000);
+    esp_hal::system::software_reset()
+}
+
+/// The build, as System info and the Wi-Fi page show it (see `build.rs`).
+const BUILD: &str = env!("BUILD_ID");
 
 /// The panel with the buffers that feed it.
 struct Screen {
@@ -246,7 +259,7 @@ fn update_status<S: Storage>(battery: &mut Battery, bus: &mut Bus, app: &mut App
     let internal = HEAP.free_caps(MemoryCapability::Internal.into());
     let psram = HEAP.free() - internal;
     app.system.push(row("Free memory", format!("{} KB + {} KB PSRAM", internal / 1024, psram / 1024)));
-    app.system.push(row("Firmware", String::from(env!("CARGO_PKG_VERSION"))));
+    app.system.push(row("Firmware", String::from(BUILD)));
 }
 
 fn internal_free() -> usize {
@@ -258,6 +271,7 @@ fn internal_free() -> usize {
 fn restart(mode: u8, bus: &mut Bus) -> ! {
     info!("restarting");
     unsafe { BOOT_MODE = mode };
+    sd::settle();
     let _ = bus.exp1.set_input(&mut bus.i2c, pin::SD_POWER, false);
     Delay::new().delay_millis(100);
     buttons::flush_log();
@@ -296,6 +310,7 @@ fn run_wifi(
     }
     info!("Wi-Fi started, {} KB internal RAM free", internal_free() / 1024);
     let mut app = App::new(storage);
+    app.version = String::from(BUILD);
     update_status(battery, bus, &mut app, card_mb);
     app.start_transfer();
     if shown {
@@ -360,6 +375,10 @@ fn run_wifi(
                 if changed {
                     screen.show_app(&mut app, bus);
                 }
+                // A firmware update: the reader installs it as it starts.
+                if app.update_received() {
+                    break;
+                }
             }
         }
         if let Some(input) = buttons.poll(bus) {
@@ -419,6 +438,13 @@ fn main() -> ! {
     // which the allocator would otherwise fill first.
     esp_alloc::heap_allocator!(size: 48 * 1024);
     esp_alloc::psram_allocator!(p.PSRAM, esp_hal::psram);
+    let mut flash = esp_storage::FlashStorage::new(p.FLASH);
+    update::check_start(&mut flash);
+    // `TEST_PANIC=1` builds firmware that fails at every start, to try going
+    // back to the firmware before after an update.
+    if option_env!("TEST_PANIC").is_some() {
+        panic!("TEST_PANIC: failing on purpose");
+    }
     let woke = !wakeup_cause().is_empty();
     let mode = unsafe { BOOT_MODE };
     unsafe { BOOT_MODE = 0 };
@@ -500,6 +526,20 @@ fn main() -> ! {
             let card_mb = sd.size / 1_000_000;
             info!("SD card: {} MB", card_mb);
             let mut app = App::new(CardStorage::new(sd));
+            app.version = String::from(BUILD);
+            if let Some(size) = update::pending(app.storage().sd()) {
+                info!("update on the card: {} KB", size / 1024);
+                app.show_message("Installing an update…");
+                screen.show_app(&mut app, &mut bus);
+                match update::install(app.storage().sd(), &mut flash) {
+                    Ok(()) => restart(0, &mut bus),
+                    Err(why) => {
+                        app.show_message(&format!("The update wasn't installed: {why}."));
+                        screen.show_app(&mut app, &mut bus);
+                        delay.delay_millis(5000);
+                    }
+                }
+            }
             update_status(&mut battery, &mut bus, &mut app, card_mb);
             let at_sleep = if woke { unsafe { PANEL_AT_SLEEP } } else { 0 };
             unsafe { PANEL_AT_SLEEP = 0 };
@@ -516,6 +556,7 @@ fn main() -> ! {
                     app.close_transfer();
                 }
                 info!("reader started in {} ms", boot.elapsed().as_millis());
+                update::confirm(&mut flash);
                 // If the panel still shows the page `settle` left there, the
                 // first refresh can be a partial one, and the press that woke
                 // the board acts on the page. After a sleep screen it just
@@ -569,6 +610,7 @@ fn main() -> ! {
     }
 
     info!("going to sleep");
+    sd::settle();
     let _ = bus.exp1.set_input(&mut bus.i2c, pin::SD_POWER, false);
     buttons.deep_sleep(&mut bus)
 }

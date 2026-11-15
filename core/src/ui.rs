@@ -15,11 +15,12 @@ use crate::hyphen::{self, Lang};
 use crate::image;
 use crate::layout::{page_of, Item, Layout, Pos};
 use crate::render::{Canvas, Renderer, BLACK, WHITE};
-use crate::settings::{Settings, SleepShows, StatusLine, SETTINGS, TEXT_SIZE};
+use crate::settings::{Settings, SleepShows, StatusLine, FONT, SETTINGS, TEXT_SIZE};
 use crate::text::{Chapter, BOLD, ITALIC};
 use crate::{Error, ReadAt};
 
 mod bookmarks;
+mod card_fonts;
 mod footnotes;
 mod transfer;
 use bookmarks::Bookmark;
@@ -123,6 +124,24 @@ pub trait Storage {
     /// The sleep screen's pictures (JPEG and PNG files in `/SLEEP/`), sorted.
     fn list_pictures(&mut self) -> Vec<String>;
     fn load_picture(&mut self, name: &str) -> Option<Vec<u8>>;
+    /// Font families: each folder in `/FONTS/`, with the `(name, size)` of
+    /// each `.ttf` and `.otf` file in it, sorted by folder name.
+    fn list_fonts(&mut self) -> Vec<(String, Vec<(String, u64)>)>;
+    /// Reads a font file, by the names `list_fonts` gave.
+    fn load_font(&mut self, family: &str, file: &str) -> Option<Vec<u8>>;
+    /// Starts a font file for an upload: `file`, such as `BOLD.TTF`, in
+    /// the folder for `family`, made if missing. Replaces a file of that
+    /// name.
+    fn create_font(&mut self, family: &str, file: &str) -> Result<Self::Upload, Error>;
+    /// Deletes one of a family's font files, or with `None` all of them.
+    fn delete_font(&mut self, family: &str, file: Option<&str>) -> Result<(), Error>;
+    /// Starts `/FIRMWARE.BIN`, a firmware update the reader installs when
+    /// it starts next, replacing one already there.
+    fn create_firmware(&mut self) -> Result<Self::Upload, Error>;
+    /// Reads `/FIRMWARE.BIN` back, a piece at a time.
+    fn read_firmware(&mut self, f: &mut dyn FnMut(&[u8])) -> Result<(), Error>;
+    /// Deletes `/FIRMWARE.BIN`, if there is one.
+    fn delete_firmware(&mut self);
 }
 
 /// A book file being written as it arrives.
@@ -460,6 +479,11 @@ impl<F: ReadAt> Reader<F> {
     }
 }
 
+/// The fonts for book text: a family from the card, or the built-in one.
+fn book<'a>(fonts: &'a Fonts, book_fonts: &'a Option<Fonts>) -> &'a Fonts {
+    book_fonts.as_ref().unwrap_or(fonts)
+}
+
 /// The reading view's layout for `s`, hyphenating with `lang`'s patterns.
 fn layout<'f>(fonts: &'f Fonts, s: &Settings, lang: Option<Lang>) -> Layout<'f> {
     let (side, top) = s.margins();
@@ -626,7 +650,22 @@ fn fit(fonts: &Fonts, face: u8, px: i32, s: &str, max: i32) -> String {
 
 pub struct App<S: Storage> {
     storage: S,
+    /// For menus and lists: always the built-in family.
     fonts: Fonts,
+    /// For book text: the family the Font setting picks, if it's not the
+    /// built-in one.
+    book_fonts: Option<Fonts>,
+    /// The family `book_fonts` holds.
+    book_family: String,
+    /// Why the Font setting's family couldn't be loaded, if it couldn't.
+    font_note: Option<String>,
+    /// Font families were sent or deleted on the transfer screen.
+    fonts_changed: bool,
+    /// The firmware's build, as the platform names it.
+    pub version: String,
+    /// A firmware update arrived on the transfer screen: the platform
+    /// restarts to install it.
+    update_received: bool,
     renderer: Renderer,
     settings: Settings,
     screen: Screen,
@@ -656,6 +695,12 @@ impl<S: Storage> App<S> {
         App {
             storage,
             fonts: Fonts::new(),
+            book_fonts: None,
+            book_family: String::from(crate::settings::BUILT_IN_FONT),
+            font_note: None,
+            fonts_changed: false,
+            version: String::new(),
+            update_received: false,
             renderer: Renderer::new(),
             settings: Settings::default(),
             screen: Screen::Library { sel: 0 },
@@ -671,6 +716,12 @@ impl<S: Storage> App<S> {
         }
     }
 
+    /// Shows a message, such as "Installing an update", until the next
+    /// screen.
+    pub fn show_message(&mut self, text: &str) {
+        self.screen = Screen::Message(String::from(text));
+    }
+
     pub fn storage(&mut self) -> &mut S {
         &mut self.storage
     }
@@ -683,6 +734,7 @@ impl<S: Storage> App<S> {
     /// shows the library.
     pub fn start(&mut self) {
         self.load_settings();
+        self.load_book_fonts();
         self.scan_library();
         let last = self.storage.load(LAST_FILE).and_then(|d| String::from_utf8(d).ok());
         if let Some(i) = last.and_then(|f| self.library.iter().position(|b| b.file == f.trim())) {
@@ -778,7 +830,7 @@ impl<S: Storage> App<S> {
             bookmarks,
             away: None,
         };
-        let layout = layout(&self.fonts, &self.settings, lang);
+        let layout = layout(book(&self.fonts, &self.book_fonts), &self.settings, lang);
         let spine = if spine < reader.epub.spine.len() { spine } else { 0 };
         if !reader.goto(&layout, spine, Target::At(pos)) && !reader.goto(&layout, 0, Target::First) {
             self.screen = Screen::Message(format!("{} has no text", reader.info.title));
@@ -821,7 +873,7 @@ impl<S: Storage> App<S> {
 
     /// Repaginates the open book after a settings change, keeping the place.
     fn relayout(&mut self) {
-        let layout = layout(&self.fonts, &self.settings, self.book_lang());
+        let layout = layout(book(&self.fonts, &self.book_fonts), &self.settings, self.book_lang());
         if let Some(r) = &mut self.reader {
             r.repaginate(&layout);
         }
@@ -837,7 +889,7 @@ impl<S: Storage> App<S> {
 
     /// Handles one input. Returns true if the screen changed.
     pub fn handle(&mut self, input: Input) -> bool {
-        let layout = layout(&self.fonts, &self.settings, self.book_lang());
+        let layout = layout(book(&self.fonts, &self.book_fonts), &self.settings, self.book_lang());
         let screen = self.screen.clone();
         match screen {
             Screen::Reading => {
@@ -996,6 +1048,7 @@ impl<S: Storage> App<S> {
                         self.screen = Screen::Settings { sel: (sel + n - 1) % n, from_reading }
                     }
                     Input::Next | Input::SkipForward => self.screen = Screen::Settings { sel: (sel + 1) % n, from_reading },
+                    Input::Menu if sel == FONT => self.next_font(),
                     Input::Menu => {
                         self.settings.cycle(sel);
                         self.save_settings();
@@ -1097,7 +1150,13 @@ impl<S: Storage> App<S> {
             Screen::Settings { sel, .. } => self.draw_settings(canvas, sel),
             Screen::System { .. } => self.draw_system(canvas),
             Screen::Transfer => self.draw_transfer(canvas),
-            Screen::Message(m) => self.centered(canvas, 0, 24, HEIGHT / 2, &m),
+            Screen::Message(m) => {
+                let lines = wrap(&self.fonts, 0, 24, &m, WIDTH - 2 * MARGIN_X, 8);
+                let top = HEIGHT / 2 - (lines.len() as i32 - 1) * 18;
+                for (k, line) in lines.iter().enumerate() {
+                    self.centered(canvas, 0, 24, top + k as i32 * 36, line);
+                }
+            }
         }
     }
 
@@ -1172,9 +1231,9 @@ impl<S: Storage> App<S> {
 
     fn draw_reading(&mut self, canvas: &mut Canvas) {
         let Some(r) = &mut self.reader else { return };
-        let layout = layout(&self.fonts, &self.settings, r.lang);
+        let layout = layout(book(&self.fonts, &self.book_fonts), &self.settings, r.lang);
         let page = layout.page(&r.chapter, r.pos());
-        self.renderer.draw_page(&self.fonts, canvas, &r.chapter, &page);
+        self.renderer.draw_page(book(&self.fonts, &self.book_fonts), canvas, &r.chapter, &page);
         for item in &page.items {
             if let &Item::Image { index, x, y, w, h } = item {
                 if let Some(picture) = r.picture(index, w, h) {
@@ -1398,13 +1457,23 @@ impl<S: Storage> App<S> {
         let left = MARGIN_X + 12;
         for (i, s) in SETTINGS.iter().enumerate() {
             let y = top + i as i32 * row_h;
-            self.draw_pair(canvas, y, s.label, self.settings.label(i));
+            let value = self.settings.label(i).to_string();
+            self.draw_pair(canvas, y, s.label, &value);
             if i == sel {
                 canvas.invert_rect(MARGIN_X, y + 2, WIDTH - 2 * MARGIN_X, row_h - 4);
             }
         }
         let y = top + SETTINGS.len() as i32 * row_h + 40;
-        self.text(canvas, ITALIC, 18, left, y, SETTINGS[sel].help);
+        match self.font_note.clone().filter(|_| sel == FONT) {
+            Some(note) => {
+                for (k, line) in wrap(&self.fonts, ITALIC, 18, &note, WIDTH - 2 * left, 2).iter().enumerate() {
+                    self.text(canvas, ITALIC, 18, left, y + k as i32 * 26, line);
+                }
+            }
+            None => {
+                self.text(canvas, ITALIC, 18, left, y, SETTINGS[sel].help);
+            }
+        }
         self.draw_hint(canvas, "Menu: change    Hold Menu: back");
     }
 

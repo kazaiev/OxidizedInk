@@ -138,7 +138,7 @@ impl<S: Storage> App<S> {
                 if spine == r.spine {
                     r.page = page_of(&r.starts, pos);
                 } else {
-                    r.goto(&layout(&self.fonts, &self.settings, r.lang), spine, Target::At(pos));
+                    r.goto(&layout(book(&self.fonts, &self.book_fonts), &self.settings, r.lang), spine, Target::At(pos));
                 }
                 self.save_progress();
                 self.screen = Screen::Reading;

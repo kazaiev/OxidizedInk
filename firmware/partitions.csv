@@ -1,0 +1,10 @@
+# The flash (4 MB): two app slots, so the reader can install an update in
+# the one not running (see src/update.rs). Flash with
+#   espflash flash --chip esp32 --partition-table partitions.csv --erase-parts otadata ...
+# which writes to ota_0 and erases otadata, so the bootloader starts ota_0.
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x4000,
+otadata,  data, ota,     0xd000,   0x2000,
+phy_init, data, phy,     0xf000,   0x1000,
+ota_0,    app,  ota_0,   0x10000,  0x1f0000,
+ota_1,    app,  ota_1,   0x200000, 0x1f0000,

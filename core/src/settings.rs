@@ -2,7 +2,7 @@
 //! `SETTINGS.TXT` as `key = value` lines, with the values shown on the
 //! Settings screen, so the file can also be edited on the card by hand.
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 
 pub struct Setting {
     /// Name in the settings file.
@@ -14,17 +14,21 @@ pub struct Setting {
     pub default: u8,
 }
 
-pub const TEXT_SIZE: usize = 0;
-pub const LINE_SPACING: usize = 1;
-pub const MARGINS: usize = 2;
-pub const ALIGNMENT: usize = 3;
-pub const HYPHENATION: usize = 4;
-pub const PARAGRAPHS: usize = 5;
-pub const STATUS_LINE: usize = 6;
-pub const PAGE_BUTTONS: usize = 7;
-pub const SLEEP: usize = 8;
-pub const SLEEP_SCREEN: usize = 9;
-pub const FULL_REFRESH: usize = 10;
+pub const FONT: usize = 0;
+pub const TEXT_SIZE: usize = 1;
+pub const LINE_SPACING: usize = 2;
+pub const MARGINS: usize = 3;
+pub const ALIGNMENT: usize = 4;
+pub const HYPHENATION: usize = 5;
+pub const PARAGRAPHS: usize = 6;
+pub const STATUS_LINE: usize = 7;
+pub const PAGE_BUTTONS: usize = 8;
+pub const SLEEP: usize = 9;
+pub const SLEEP_SCREEN: usize = 10;
+pub const FULL_REFRESH: usize = 11;
+
+/// The built-in font family, the font setting's default.
+pub const BUILT_IN_FONT: &str = "Literata";
 
 /// Values behind the options, in the same order.
 const FONT_SIZES: [i32; 8] = [18, 20, 22, 24, 26, 28, 32, 36];
@@ -34,7 +38,16 @@ const MARGIN_PX: [(i32, i32); 3] = [(20, 20), (36, 28), (56, 40)];
 const SLEEP_MINUTES: [u32; 6] = [1, 2, 5, 10, 15, 30];
 const FULL_REFRESH_EVERY: [u32; 4] = [1, 5, 10, 20];
 
-pub const SETTINGS: [Setting; 11] = [
+pub const SETTINGS: [Setting; 12] = [
+    // Its options are the built-in family and the folders in /FONTS on the
+    // card, kept in `Settings::font` rather than in the table.
+    Setting {
+        key: "font",
+        label: "Font",
+        help: "For books. More come from folders in /FONTS on the card.",
+        options: &[BUILT_IN_FONT],
+        default: 0,
+    },
     Setting {
         key: "text_size",
         label: "Text size",
@@ -137,15 +150,17 @@ pub enum SleepShows {
     Page,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     /// Option index of each setting.
     values: [u8; SETTINGS.len()],
+    /// The font family for books: a folder in /FONTS, or `BUILT_IN_FONT`.
+    pub font: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { values: SETTINGS.map(|s| s.default) }
+        Settings { values: SETTINGS.map(|s| s.default), font: BUILT_IN_FONT.to_string() }
     }
 }
 
@@ -157,6 +172,12 @@ impl Settings {
         for line in core::str::from_utf8(data).unwrap_or("").lines() {
             let Some((key, value)) = line.split_once('=') else { continue };
             let (key, value) = (key.trim(), value.trim());
+            if key == SETTINGS[FONT].key {
+                if !value.is_empty() {
+                    s.font = value.to_string();
+                }
+                continue;
+            }
             let Some(i) = SETTINGS.iter().position(|d| d.key == key) else { continue };
             if let Some(o) = SETTINGS[i].options.iter().position(|o| o.eq_ignore_ascii_case(value)) {
                 s.values[i] = o as u8;
@@ -170,15 +191,19 @@ impl Settings {
         for (d, &v) in SETTINGS.iter().zip(&self.values) {
             out.push_str(d.key);
             out.push_str(" = ");
-            out.push_str(d.options[v as usize]);
+            out.push_str(if d.key == SETTINGS[FONT].key { &self.font } else { d.options[v as usize] });
             out.push('\n');
         }
         out
     }
 
     /// The selected option's label.
-    pub fn label(&self, i: usize) -> &'static str {
-        SETTINGS[i].options[self.values[i] as usize]
+    pub fn label(&self, i: usize) -> &str {
+        if i == FONT {
+            &self.font
+        } else {
+            SETTINGS[i].options[self.values[i] as usize]
+        }
     }
 
     /// Selects the next option, wrapping around.
@@ -286,8 +311,10 @@ mod tests {
         assert_eq!(d.font_px(), 24);
         assert_eq!(Settings::parse(d.to_text().as_bytes()), d);
 
-        let s = Settings::parse(b"# comment\ntext_size = 32\r\nalignment=left\nmargins = Huge\nbogus = 1\n24\n");
+        let s = Settings::parse(b"# comment\ntext_size = 32\r\nalignment=left\nmargins = Huge\nbogus = 1\n24\nfont = Source Serif 4\n");
         assert_eq!(s.font_px(), 32);
+        assert_eq!(s.font, "Source Serif 4");
+        assert_eq!(d.font, BUILT_IN_FONT);
         assert!(!s.justify());
         assert_eq!(s.margins(), d.margins());
         assert_eq!(Settings::parse(s.to_text().as_bytes()), s);

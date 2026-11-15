@@ -35,9 +35,24 @@ and [espflash](https://github.com/esp-rs/espflash):
 ```bash
 . ~/export-esp.sh
 cd firmware
-cargo build --release
-espflash flash --monitor target/xtensa-esp32-none-elf/release/inkreader
+cargo run --release   # builds, flashes and shows the log
 ```
+
+The flash holds two app slots (`firmware/partitions.csv`), so `cargo run`
+flashes with `--partition-table partitions.csv --erase-parts otadata`:
+by hand that's
+`espflash flash --monitor --chip esp32 --partition-table partitions.csv --erase-parts otadata target/xtensa-esp32-none-elf/release/inkreader`.
+
+**Updates without USB.** Make an update file with
+`espflash save-image --chip esp32 target/xtensa-esp32-none-elf/release/inkreader inkreader.bin`,
+then send it from the Wi-Fi page (Firmware, Update), or copy it to the
+card's root as `FIRMWARE.BIN`. Either way the reader installs it the next
+time it starts: it checks the image (header, checksum and SHA-256),
+writes it to the other slot (about 40 s, with "Installing an update" on
+the screen), checks it again there, and starts it. If the new firmware
+fails to start the reader three times, the firmware before comes back.
+System info and the Wi-Fi page show which build is running (its commit
+and date, `+` if built with changes not committed).
 
 Copy `.epub` files to the root of a FAT-formatted SD card. The three side
 buttons (wired as in `case/README.md`) are Menu, Prev and Next from the top;
@@ -108,6 +123,16 @@ names on the card (`PRIDEAND.EPU`), as the SD library can't make long ones;
 the library shows their titles. `TEST_WIFI=1 cargo build --release` starts
 Wi-Fi transfer on power-on, to try it without the buttons.
 
+**Fonts.** Books are set in Literata, built in. Other font families can
+be sent from the same page: drop a family's `.ttf` or `.otf` files (its
+regular style, and bold, italic and bold italic if it has them, up to
+1200 KB in all) and the page reads each file's family and style from the
+font itself. Or copy them to the card in a folder per family in
+`/FONTS/` (`/FONTS/Source Serif 4/SourceSerif4-Regular.ttf`, and so on;
+the file names tell the styles apart). Settings, Font picks the family
+for books; menus and lists stay in Literata. A family the reader can't
+use shows why under Settings, and books keep Literata meanwhile.
+
 ## Testing
 
 Put some `.epub` files in `testbooks/` (it's gitignored), then run:
@@ -143,6 +168,7 @@ memory; any button reads them again, Back leaves. They are saved to
 `SETTINGS.TXT`, which can also be edited by hand:
 
 ```text
+font = Literata
 text_size = 24
 line_spacing = Normal
 margins = Normal

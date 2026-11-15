@@ -5,7 +5,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use ab_glyph::{point, Font, GlyphId};
+use ab_glyph::{point, GlyphId};
 
 use crate::fonts::{is_invisible, Fonts, Meter};
 use crate::layout::{Item, Page};
@@ -92,7 +92,8 @@ struct GlyphBitmap {
 
 /// Rasterizes glyphs on demand and keeps them for reuse.
 pub struct Renderer {
-    cache: BTreeMap<(u8, u16, u16), GlyphBitmap>,
+    /// By family id, style bits, size and glyph id.
+    cache: BTreeMap<(u32, u8, u16, u16), GlyphBitmap>,
     bytes: usize,
     /// Drop the whole cache when it grows past this many bytes.
     pub budget: usize,
@@ -110,7 +111,7 @@ impl Renderer {
     }
 
     fn glyph(&mut self, fonts: &Fonts, face: u8, px: i32, id: GlyphId) -> &GlyphBitmap {
-        let key = (face, px as u16, id.0);
+        let key = (fonts.id, face, px as u16, id.0);
         if !self.cache.contains_key(&key) {
             if self.bytes > self.budget {
                 self.cache.clear();
@@ -166,7 +167,7 @@ impl Renderer {
 
 fn rasterize(fonts: &Fonts, face: u8, px: i32, id: GlyphId) -> GlyphBitmap {
     let glyph = id.with_scale_and_position(fonts.scale(px), point(0.0, 0.0));
-    let Some(outline) = fonts.face(face).outline_glyph(glyph) else {
+    let Some(outline) = fonts.outline(face, glyph) else {
         return GlyphBitmap { left: 0, top: 0, w: 0, h: 0, cov: Box::new([]) };
     };
     let b = outline.px_bounds();

@@ -1,6 +1,7 @@
 fn main() {
     linker_be_nice();
     check_xtensa_linker_available();
+    build_id();
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
     println!("cargo:rustc-link-arg=-Tlinkall.x");
 }
@@ -129,4 +130,24 @@ fn linker_be_nice() {
         "cargo:rustc-link-arg=-Wl,--error-handling-script={}",
         std::env::current_exe().unwrap().display()
     );
+}
+
+/// `BUILD_ID`: the commit and date the firmware was built from, such as
+/// "3f19b2c 2026-10-25", with "+" when there were changes not committed.
+fn build_id() {
+    let run = |cmd: &str, args: &[&str]| {
+        std::process::Command::new(cmd)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let commit = run("git", &["rev-parse", "--short=7", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    let dirty = run("git", &["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty());
+    let date = run("date", &["-u", "+%Y-%m-%d"]).unwrap_or_default();
+    println!("cargo:rustc-env=BUILD_ID={}{} {}", commit, if dirty { "+" } else { "" }, date);
+    for path in ["../.git/HEAD", "../.git/index", "src", "../core/src"] {
+        println!("cargo:rerun-if-changed={}", path);
+    }
 }

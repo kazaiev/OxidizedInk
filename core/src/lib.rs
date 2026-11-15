@@ -7,6 +7,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod epub;
+pub mod firmware;
 pub mod fonts;
 pub mod http;
 pub mod hyphen;

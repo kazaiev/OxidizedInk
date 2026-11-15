@@ -94,7 +94,7 @@ impl<S: Storage> App<S> {
         let Some(r) = &mut self.reader else { return };
         let links = r.links_here();
         if let [only] = links[..] {
-            r.follow(&layout(&self.fonts, &self.settings, r.lang), only);
+            r.follow(&layout(book(&self.fonts, &self.book_fonts), &self.settings, r.lang), only);
             self.save_progress();
             self.screen = Screen::Reading;
         } else {
@@ -119,7 +119,7 @@ impl<S: Storage> App<S> {
             }
             Input::Back => self.screen = Screen::Reading,
             Input::Menu => {
-                r.follow(&layout(&self.fonts, &self.settings, r.lang), links[sel.min(n - 1)]);
+                r.follow(&layout(book(&self.fonts, &self.book_fonts), &self.settings, r.lang), links[sel.min(n - 1)]);
                 self.save_progress();
                 self.screen = Screen::Reading;
             }

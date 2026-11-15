@@ -19,8 +19,11 @@ bench = false
 [dependencies]
 esp-hal = { version = "~1.2.2", features = ["esp32", "log-04", "unstable", "exception-handler"] }
 esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32", "log-04"] }
-esp-alloc = { version = "0.11.0", features = ["esp32"] }
-esp-backtrace = { version = "0.20.0", features = ["esp32", "panic-handler", "println", "custom-pre-backtrace"] }
+# Without its global allocator: src/heap.rs puts large blocks in PSRAM.
+esp-alloc = { version = "0.11.0", default-features = false, features = ["esp32", "compat"] }
+esp-backtrace = { version = "0.20.0", features = ["esp32", "panic-handler", "println", "custom-pre-backtrace", "custom-halt"] }
+# Writing firmware updates to the other app slot.
+esp-storage = { version = "0.10.0", features = ["esp32"] }
 esp-println = { version = "0.18.0", features = ["esp32", "log-04"] }
 critical-section = "1.2.0"
 log = "0.4.27"
