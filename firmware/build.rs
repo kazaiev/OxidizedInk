@@ -132,8 +132,9 @@ fn linker_be_nice() {
     );
 }
 
-/// `BUILD_ID`: the commit and date the firmware was built from, such as
-/// "3f19b2c 2026-10-25", with "+" when there were changes not committed.
+/// `BUILD_ID`: the version, and the commit and date the firmware was built
+/// from, such as "0.1.0 (3f19b2c 2026-10-25)", with "+" after the commit
+/// when there were changes not committed.
 fn build_id() {
     let run = |cmd: &str, args: &[&str]| {
         std::process::Command::new(cmd)
@@ -146,7 +147,8 @@ fn build_id() {
     let commit = run("git", &["rev-parse", "--short=7", "HEAD"]).unwrap_or_else(|| "unknown".into());
     let dirty = run("git", &["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty());
     let date = run("date", &["-u", "+%Y-%m-%d"]).unwrap_or_default();
-    println!("cargo:rustc-env=BUILD_ID={}{} {}", commit, if dirty { "+" } else { "" }, date);
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    println!("cargo:rustc-env=BUILD_ID={} ({}{} {})", version, commit, if dirty { "+" } else { "" }, date);
     for path in ["../.git/HEAD", "../.git/index", "src", "../core/src"] {
         println!("cargo:rerun-if-changed={}", path);
     }

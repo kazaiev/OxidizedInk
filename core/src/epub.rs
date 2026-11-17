@@ -1,12 +1,57 @@
-//! EPUB 2/3 package parsing: container, OPF metadata, spine and table of contents.
+//! EPUB 2/3 package parsing: container, OPF metadata, spine and table of
+//! contents. Plain-text and Markdown books open as the same type, their
+//! chapters set as XHTML by `plain`.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use crate::css::Stylesheet;
+use crate::plain;
 use crate::text::{self, Chapter, Image};
 use crate::xml::{self, local_name, Token, Tokenizer};
 use crate::zip::Zip;
 use crate::{image, Error, ReadAt};
+
+/// Larger plain-text and Markdown books aren't opened: they're read whole.
+const MAX_TEXT_BOOK: u64 = 2 * 1024 * 1024;
+
+/// The file names of the books the reader opens.
+pub fn is_book(name: &str) -> bool {
+    kind(name).is_some()
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Epub,
+    Text,
+    Markdown,
+}
+
+fn kind(name: &str) -> Option<Kind> {
+    let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    match ext.as_str() {
+        "epub" | "epu" => Some(Kind::Epub),
+        "txt" => Some(Kind::Text),
+        "md" | "markdown" => Some(Kind::Markdown),
+        _ => None,
+    }
+}
+
+/// Opens a book, as its file's name says it is: EPUB, plain text or
+/// Markdown.
+pub fn open<F: ReadAt>(file: F, name: &str) -> Result<Epub<F>, Error> {
+    match kind(name) {
+        Some(Kind::Epub) | None => Epub::open(file),
+        Some(k) => Epub::open_text(file, name, k == Kind::Markdown),
+    }
+}
+
+/// Where a book's chapters come from.
+enum Content<F: ReadAt> {
+    Zip(Zip<F>),
+    /// A plain-text or Markdown book, set as XHTML: a string per chapter.
+    Text(Vec<String>),
+}
 
 /// How much of a picture is read to find its size. A JPEG whose frame
 /// header comes later, after large metadata, is read whole.
@@ -29,7 +74,7 @@ pub struct TocEntry {
 }
 
 pub struct Epub<F: ReadAt> {
-    zip: Zip<F>,
+    content: Content<F>,
     pub title: String,
     pub author: String,
     /// `dc:language`, such as "en" or "en-US"; empty if the book doesn't say.
@@ -38,6 +83,49 @@ pub struct Epub<F: ReadAt> {
     pub toc: Vec<TocEntry>,
     /// The cover picture's path inside the ZIP.
     pub cover: Option<String>,
+    /// Read the book's CSS when setting its chapters.
+    pub styles: bool,
+    /// Its stylesheets read so far, by path.
+    sheets: Vec<(String, Stylesheet)>,
+}
+
+/// Where a chapter's CSS comes from, in the order it names it.
+enum Source {
+    /// A stylesheet in the book, by path.
+    File(String),
+    /// A `<style>` element's text.
+    Inline(String),
+}
+
+/// The CSS a chapter names in its head: `<link rel="stylesheet">`s and
+/// `<style>` elements. `dir` is the chapter's directory.
+fn css_sources(doc: &str, dir: &str) -> Vec<Source> {
+    let mut out = Vec::new();
+    let mut style: Option<String> = None;
+    for tok in Tokenizer::new(doc) {
+        match tok {
+            Token::Start { name, attrs, self_closing } => match local_name(name).to_ascii_lowercase().as_str() {
+                "body" => break,
+                "link" if xml::attr(attrs, "rel").is_some_and(|r| r.split_whitespace().any(|w| w.eq_ignore_ascii_case("stylesheet"))) => {
+                    if let Some(href) = xml::attr(attrs, "href") {
+                        out.push(Source::File(resolve(dir, &xml::decode_entities(href))));
+                    }
+                }
+                "style" if !self_closing => style = Some(String::new()),
+                _ => {}
+            },
+            Token::Text(t) | Token::CData(t) => {
+                if let Some(s) = &mut style {
+                    s.push_str(t);
+                }
+            }
+            Token::End { name } if local_name(name).eq_ignore_ascii_case("style") => {
+                out.extend(style.take().map(Source::Inline));
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 fn utf8(bytes: Vec<u8>) -> String {
@@ -241,7 +329,17 @@ impl<F: ReadAt> Epub<F> {
         }
 
         let cover = find_cover(&manifest, cover_id.as_deref()).map(|m| resolve(&base, &m.href));
-        let mut epub = Epub { zip, title, author, language, spine, toc: Vec::new(), cover };
+        let mut epub = Epub {
+            content: Content::Zip(zip),
+            title,
+            author,
+            language,
+            spine,
+            toc: Vec::new(),
+            cover,
+            styles: true,
+            sheets: Vec::new(),
+        };
 
         // Prefer the EPUB 3 navigation document, fall back to the NCX.
         let nav = manifest
@@ -293,7 +391,7 @@ impl<F: ReadAt> Epub<F> {
     }
 
     fn parse_nav(&mut self, path: &str) -> Result<Vec<TocEntry>, Error> {
-        let doc = utf8(self.zip.read(path)?);
+        let doc = utf8(self.read(path)?);
         let base = dir_of(path).to_string();
         let mut out = Vec::new();
         let mut in_toc = false;
@@ -350,7 +448,7 @@ impl<F: ReadAt> Epub<F> {
     }
 
     fn parse_ncx(&mut self, path: &str) -> Result<Vec<TocEntry>, Error> {
-        let doc = utf8(self.zip.read(path)?);
+        let doc = utf8(self.read(path)?);
         let base = dir_of(path).to_string();
         let mut out = Vec::new();
         let mut depth: u8 = 0;
@@ -393,20 +491,87 @@ impl<F: ReadAt> Epub<F> {
 
     /// A file in the book, such as a picture.
     pub fn read(&mut self, path: &str) -> Result<Vec<u8>, Error> {
-        self.zip.read(path)
+        match &mut self.content {
+            Content::Zip(zip) => zip.read(path),
+            Content::Text(_) => Err(Error::Epub("a text book has no files")),
+        }
     }
 
     /// Loads and parses one spine item into styled text blocks and pictures.
     pub fn chapter(&mut self, index: usize) -> Result<Chapter, Error> {
         let item = self.spine.get(index).ok_or(Error::Epub("chapter out of range"))?;
         let path = item.path.clone();
-        let doc = utf8(self.zip.read(&path)?);
-        let zip = &mut self.zip;
-        Ok(text::parse_xhtml(&doc, |src| {
+        let zip = match &mut self.content {
+            Content::Zip(zip) => zip,
+            Content::Text(chapters) => return Ok(text::parse_xhtml(&chapters[index], |_| None)),
+        };
+        let doc = utf8(zip.read(&path)?);
+        let sources = if self.styles { css_sources(&doc, dir_of(&path)) } else { Vec::new() };
+        // Each stylesheet is read once; a missing one is an empty one.
+        for source in &sources {
+            if let Source::File(f) = source {
+                if !self.sheets.iter().any(|(p, _)| p == f) {
+                    let sheet = zip.read(f).map(|d| Stylesheet::parse(&utf8(d))).unwrap_or_default();
+                    self.sheets.push((f.clone(), sheet));
+                }
+            }
+        }
+        let inline: Vec<Stylesheet> = sources
+            .iter()
+            .filter_map(|s| match s {
+                Source::Inline(css) => Some(Stylesheet::parse(css)),
+                Source::File(_) => None,
+            })
+            .collect();
+        let mut inline_sheets = inline.iter();
+        let sheets: Vec<&Stylesheet> = sources
+            .iter()
+            .filter_map(|s| match s {
+                Source::File(f) => self.sheets.iter().find(|(p, _)| p == f).map(|(_, sheet)| sheet),
+                Source::Inline(_) => inline_sheets.next(),
+            })
+            .collect();
+        let css = self.styles.then_some(sheets.as_slice());
+        Ok(text::parse_styled(&doc, css, |src| {
             let path = resolve(dir_of(&path), src);
             let (width, height) = picture_size(zip, &path)?;
             Some(Image { path, width, height, caption: 0 })
         }))
+    }
+
+    /// Opens a plain-text or Markdown book: read whole and set as XHTML
+    /// chapters, which are spine items named by their numbers.
+    pub fn open_text(mut file: F, name: &str, markdown: bool) -> Result<Self, Error> {
+        if file.size() > MAX_TEXT_BOOK {
+            return Err(Error::Epub("text book too large"));
+        }
+        let mut data = alloc::vec![0u8; file.size() as usize];
+        file.read_at(0, &mut data)?;
+        let text = plain::decode(&data);
+        drop(data);
+        let book = if markdown { plain::markdown(&text, name) } else { plain::plain(&text, name) };
+        let spine = book
+            .chapters
+            .iter()
+            .enumerate()
+            .map(|(i, c)| SpineItem { path: i.to_string(), size: c.len() as u32 })
+            .collect();
+        let toc = book
+            .toc
+            .into_iter()
+            .map(|(title, spine, id, depth)| TocEntry { title, spine, fragment: Some(id), depth })
+            .collect();
+        Ok(Epub {
+            content: Content::Text(book.chapters),
+            title: book.title,
+            author: book.author,
+            language: book.language,
+            spine,
+            toc,
+            cover: None,
+            styles: true,
+            sheets: Vec::new(),
+        })
     }
 
     /// Title of the TOC entry that covers `spine`, if any.

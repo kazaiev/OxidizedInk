@@ -311,6 +311,7 @@ fn run_wifi(
     info!("Wi-Fi started, {} KB internal RAM free", internal_free() / 1024);
     let mut app = App::new(storage);
     app.version = String::from(BUILD);
+    app.local_name = Some(inkreader_core::mdns::NAME);
     update_status(battery, bus, &mut app, card_mb);
     app.start_transfer();
     if shown {

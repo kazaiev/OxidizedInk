@@ -1,8 +1,8 @@
 # OxidizedInk
 
-An EPUB e-book reader for the Soldered **Inkplate 6**, written in Rust.
-Books are parsed and laid out on the device itself. Copy `.epub` files to the
-SD card and read.
+An e-book reader for the Soldered **Inkplate 6**, written in Rust. EPUB,
+plain-text and Markdown books are parsed and laid out on the device itself.
+Copy them to the SD card and read.
 
 **Status:** work in progress. The reader runs on the Inkplate 6 V2. It shows
 the library from the SD card with each book's cover, opens books
@@ -26,6 +26,27 @@ https://alex.k4zka.online/projects/oxidized-ink/) for the full plan and status.
 | `case/` | OpenSCAD case with a button strip and room for a 606090 cell (see `case/README.md`) |
 | `fonts/` | Literata, SIL Open Font License (see `fonts/OFL.txt`) |
 | `docs/HARDWARE.md` | Inkplate 6 hardware notes, from Soldered's Arduino library |
+
+## Installing a release
+
+Each [release](https://github.com/kazaiev/oxidized-ink/releases) has two
+firmware files (see `CHANGELOG.md` for what's in it):
+
+- `oxidized-ink-VERSION-full.bin`, for the first install over USB, and
+  for a reader with firmware older than 0.1.0. Erase the flash, then write
+  the file at offset 0:
+
+  ```bash
+  espflash erase-flash
+  espflash write-bin 0x0 oxidized-ink-0.1.0-full.bin
+  ```
+
+  Or in a browser, with Espressif's [esptool-js](https://espressif.github.io/esptool-js/)
+  page: connect, erase the flash, then program the file at address 0x0.
+  The SD card keeps its books, settings and places.
+- `oxidized-ink-VERSION.bin`, for updating a reader that runs 0.1.0 or
+  later: send it from the Wi-Fi page (Firmware, Update), or copy it to the
+  card's root as `FIRMWARE.BIN`. The reader installs it as it starts.
 
 ## Firmware
 
@@ -54,7 +75,11 @@ fails to start the reader three times, the firmware before comes back.
 System info and the Wi-Fi page show which build is running (its commit
 and date, `+` if built with changes not committed).
 
-Copy `.epub` files to the root of a FAT-formatted SD card. The three side
+Copy books to a FAT-formatted SD card: `.epub`, and `.txt` and `.md`
+files up to 2 MB, at the top or in folders up to three deep (not in
+`READER`, `SLEEP` or `FONTS`, which are the reader's own). Markdown headings become chapters in the contents;
+in plain text, "Chapter …" lines do, and a Project Gutenberg book shows
+without its header and license. The three side
 buttons (wired as in `case/README.md`) are Menu, Prev and Next from the top;
 holding Menu for 0.6 s is Back. Holding Next while reading goes to the
 next chapter; holding Prev goes back to the start of the chapter, or from
@@ -86,6 +111,13 @@ While it sleeps, the panel shows what the "Sleep screen" setting picks:
 Drawing a cover takes about 2.5 s. To see the sleep screen without waiting
 for "Sleep after", build with `TEST_IDLE=20 cargo build --release` (seconds).
 
+Books are set as their own CSS says where it matters on a page: centered
+and right-aligned text, bold and italics set by class, paragraphs
+without indents or with space between them, set-in blocks, hidden text
+and page breaks. Sizes and fonts stay the reader's, and a paragraph's
+left or justified follows the Alignment setting. "Book styles" turns the
+book's CSS off.
+
 Pictures in books show at their own size, or shrunk to fit the page, with
 their captions. A page with a large picture takes about 1.5 s longer to draw.
 
@@ -103,6 +135,16 @@ Progress and settings are saved in `/READER/` on the card. The library
 shows each book's cover, title, author and how much of it you've read. The
 first time a cover is shown it is shrunk from the book and saved there as a
 `.THM` file, which takes a moment; after that the library opens quickly.
+Folders come first, each with how many books it holds; Menu opens one and
+holding Menu goes back up. The "Library order" setting puts books in
+order: **Recent** (the default: the books opened or added last first),
+**Title**, **Author** (by surname) or **Added** (the books added last
+first). A book keeps its place and bookmarks when moved to another
+folder.
+
+**Delete book**, the reading menu's last item, deletes the open book from
+the card with its place and bookmarks, after asking (Keep it is
+selected first).
 
 **Wi-Fi transfer** sends books to the reader from a browser. Once, put a
 `WIFI.TXT` in `/READER/` on the card naming a 2.4 GHz network (WPA2 or
@@ -114,13 +156,19 @@ password = its password
 ```
 
 Then pick **Wi-Fi transfer** in the library. The reader restarts into Wi-Fi
-mode, joins the network and shows an address such as
-`http://192.168.1.23/`. Open it on a computer or phone on the same network:
-drop `.epub` files on the page to send them (about 300 KB/s), click a title
-to download a book, or delete one. Holding Menu, or the "Sleep after" time
+mode, joins the network and shows `http://oxidized.local/` (and its
+address, such as `http://192.168.1.23/`, for phones that don't find local
+names). Open it on a computer or phone on the same network: drop `.epub`
+files on the page to send them (about 300 KB/s), click a title to download
+a book, or delete one. The page also has every setting (used once you
+leave Wi-Fi transfer) and the network's name and password (used the next
+time). Holding Menu, or the "Sleep after" time
 without use, restarts it into the library. Books sent this way get short
 names on the card (`PRIDEAND.EPU`), as the SD library can't make long ones;
-the library shows their titles. `TEST_WIFI=1 cargo build --release` starts
+the library shows their titles. "Send books to" on the page picks a
+folder, or makes a new one; on the card a new folder gets a short name,
+and its own name goes in a `NAME.TXT` inside it. Deleting a folder's last
+book deletes the folder too, if nothing else is in it. `TEST_WIFI=1 cargo build --release` starts
 Wi-Fi transfer on power-on, to try it without the buttons.
 
 **Fonts.** Books are set in Literata, built in. Other font families can
@@ -180,6 +228,8 @@ page_buttons = Normal
 sleep = 5 min
 sleep_screen = Book cover
 full_refresh = Every 10
+library_order = Recent
+book_styles = On
 ```
 
 Reading state goes to `READER/` inside the books directory, like `/READER/`
@@ -201,3 +251,8 @@ after each one:
 ```bash
 cargo run --release -p inkreader-sim -- --state /tmp/st --keys nnmnnmb --out /tmp/shots
 ```
+
+## License
+
+oxidized-ink is licensed under the [Apache License, Version 2.0](LICENSE-APACHE).
+The built-in font, Literata, is under the SIL Open Font License (`fonts/OFL.txt`).

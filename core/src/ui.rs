@@ -1,15 +1,16 @@
 //! The reader's screens and navigation, driven by four abstract inputs.
 //!
-//! Screens: the library (books on the card), the reading view, a menu over
-//! the page, the table of contents, the settings and system info, and the
-//! screens left up while the device sleeps. All state that must survive
+//! Screens: the library (books on the card, in their folders), the reading
+//! view, a menu over the page, the table of contents, the settings and
+//! system info, asking before a book is deleted, and the screens left up
+//! while the device sleeps. All state that must survive
 //! sleep or power-off goes through `Storage` as small text files.
 
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use crate::epub::Epub;
+use crate::epub::{self, Epub};
 use crate::fonts::{Fonts, Meter};
 use crate::hyphen::{self, Lang};
 use crate::image;
@@ -22,8 +23,10 @@ use crate::{Error, ReadAt};
 mod bookmarks;
 mod card_fonts;
 mod footnotes;
+mod library;
 mod transfer;
 use bookmarks::Bookmark;
+pub use library::{MAX_FOLDERS, RESERVED_FOLDERS};
 pub use transfer::{Network, Wifi, WIFI_FILE};
 
 /// Portrait canvas size in pixels.
@@ -106,15 +109,18 @@ pub enum Input {
 pub trait Storage {
     type Book: ReadAt;
     type Upload: Upload;
-    /// `(file name, size in bytes)` of each book.
+    /// `(path, size in bytes)` of each book: at the top level, and in
+    /// folders up to `MAX_FOLDERS` deep, other than `RESERVED_FOLDERS`. A
+    /// path is folder and file names joined by `/`.
     fn list_books(&mut self) -> Vec<(String, u64)>;
+    /// Opens a book, by its path in `list_books`.
     fn open_book(&mut self, name: &str) -> Result<Self::Book, Error>;
-    /// Starts a new book file for an upload the browser calls `name` (an
-    /// `.epub` without directories). Returns the file's name as
-    /// `list_books` will give it, which may differ: the card keeps short
-    /// names.
+    /// Starts a new book file for an upload the browser calls `name`: a
+    /// book's file name, after the folders to put it in, which are made if
+    /// missing. Returns the book's path as `list_books` will give it, which
+    /// may differ: the card keeps short names.
     fn create_book(&mut self, name: &str) -> Result<(String, Self::Upload), Error>;
-    /// Deletes a book file, by its name in `list_books`.
+    /// Deletes a book file, by its path in `list_books`.
     fn delete_book(&mut self, name: &str) -> Result<(), Error>;
     /// Reads a state file. Names are 8.3 (`LAST.TXT`, `1A2B3C4D.POS`).
     fn load(&mut self, name: &str) -> Option<Vec<u8>>;
@@ -153,10 +159,15 @@ pub trait Upload {
 
 #[derive(Debug, Clone)]
 pub struct BookInfo {
+    /// Its path: folder and file names joined by `/`.
     pub file: String,
     pub size: u64,
     pub title: String,
     pub author: String,
+    /// When the library first listed it, and when it was last opened from
+    /// the library (0 if never), as steps of a counter.
+    pub added: u32,
+    pub opened: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +184,9 @@ enum Screen {
     /// `from_reading`: opened from the reading menu rather than the library.
     Settings { sel: usize, from_reading: bool },
     System { from_reading: bool },
+    /// Asking whether to delete the open book: `yes` when Delete is
+    /// selected rather than Keep.
+    Delete { yes: bool },
     Transfer,
     Message(String),
 }
@@ -200,9 +214,10 @@ enum MenuItem {
     Settings,
     System,
     Library,
+    Delete,
 }
 
-const MENU: [MenuItem; 11] = [
+const MENU: [MenuItem; 12] = [
     MenuItem::BackToBook,
     MenuItem::Bookmark,
     MenuItem::Bookmarks,
@@ -214,6 +229,7 @@ const MENU: [MenuItem; 11] = [
     MenuItem::Settings,
     MenuItem::System,
     MenuItem::Library,
+    MenuItem::Delete,
 ];
 
 impl MenuItem {
@@ -230,6 +246,7 @@ impl MenuItem {
             MenuItem::Settings => "Settings",
             MenuItem::System => "System info",
             MenuItem::Library => "Library",
+            MenuItem::Delete => "Delete book",
         }
     }
 }
@@ -335,8 +352,11 @@ impl<F: ReadAt> Reader<F> {
             .filter(|(_, e)| e.spine == s)
             .map(|(i, e)| (i, e.fragment.as_deref().and_then(|f| self.chapter.anchor(f)).unwrap_or(0)))
             .collect();
-        // Each TOC entry starts a page, so jumping to one shows it at the top.
-        let mut breaks: Vec<usize> = self.marks.iter().map(|&(_, b)| b).filter(|&b| b > 0).collect();
+        // Each TOC entry starts a page, so jumping to one shows it at the
+        // top, as do the book's own page breaks.
+        let mut breaks: Vec<usize> = self.marks.iter().map(|&(_, b)| b).collect();
+        breaks.extend_from_slice(&self.chapter.breaks);
+        breaks.retain(|&b| b > 0);
         breaks.sort_unstable();
         breaks.dedup();
         self.chapter.breaks = breaks;
@@ -354,6 +374,29 @@ impl<F: ReadAt> Reader<F> {
         let pos = self.pos();
         self.starts = layout.paginate(&self.chapter);
         self.page = page_of(&self.starts, pos);
+    }
+
+    /// Sets the chapter again from the book, as when the Book styles
+    /// setting changes. Blocks the book's CSS hides or splits come and go,
+    /// so the place is found again by the page's first words.
+    fn reload(&mut self, layout: &Layout) {
+        let pos = self.pos();
+        let words: String = self.chapter.blocks.get(pos.block as usize).map_or(String::new(), |b| {
+            b.text.get(pos.byte as usize..).unwrap_or("").chars().take(40).collect()
+        });
+        if !self.goto(layout, self.spine, Target::At(pos)) || words.trim().is_empty() {
+            return;
+        }
+        let found = self
+            .chapter
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| b.text.find(&words).map(|at| (i, at)))
+            .min_by_key(|&(i, _)| i.abs_diff(pos.block as usize));
+        if let Some((block, byte)) = found {
+            self.page = page_of(&self.starts, Pos::new(block, byte));
+        }
     }
 
     fn next_page(&mut self, layout: &Layout) -> bool {
@@ -499,16 +542,19 @@ fn layout<'f>(fonts: &'f Fonts, s: &Settings, lang: Option<Lang>) -> Layout<'f> 
         justify: s.justify(),
         spaced: s.spaced(),
         hyphenate: lang.filter(|_| s.hyphenate()),
+        tables: Default::default(),
     }
 }
 
 /// A book's state file with extension `ext`: `POS` for the place reached
 /// (spine item, block, byte and percent), `THM` for the cover thumbnail.
 /// Named by FNV-1a over the file name and size, so a changed book starts
-/// afresh.
+/// afresh. The name is without its folders, so a book moved to another
+/// folder keeps them.
 fn book_file(info: &BookInfo, ext: &str) -> String {
+    let name = info.file.rsplit('/').next().unwrap_or(&info.file);
     let mut h: u32 = 0x811c_9dc5;
-    for b in info.file.bytes().chain(info.size.to_le_bytes()) {
+    for b in name.bytes().chain(info.size.to_le_bytes()) {
         h = (h ^ b as u32).wrapping_mul(0x0100_0193);
     }
     format!("{:08X}.{}", h, ext)
@@ -661,15 +707,24 @@ pub struct App<S: Storage> {
     font_note: Option<String>,
     /// Font families were sent or deleted on the transfer screen.
     fonts_changed: bool,
+    /// Settings were changed on the transfer screen.
+    settings_changed: bool,
     /// The firmware's build, as the platform names it.
     pub version: String,
+    /// The reader's name on the network, if the platform answers for one
+    /// (`mdns::NAME`).
+    pub local_name: Option<&'static str>,
     /// A firmware update arrived on the transfer screen: the platform
     /// restarts to install it.
     update_received: bool,
     renderer: Renderer,
     settings: Settings,
     screen: Screen,
+    /// The books, in the Library order setting's order.
     library: Vec<BookInfo>,
+    /// The library's folder shown: folder names joined by `/`, `""` for the
+    /// top level.
+    folder: String,
     /// Covers and progress of the books shown lately, oldest first.
     shelf: Vec<Shelved>,
     reader: Option<Reader<S::Book>>,
@@ -699,12 +754,15 @@ impl<S: Storage> App<S> {
             book_family: String::from(crate::settings::BUILT_IN_FONT),
             font_note: None,
             fonts_changed: false,
+            settings_changed: false,
             version: String::new(),
+            local_name: None,
             update_received: false,
             renderer: Renderer::new(),
             settings: Settings::default(),
             screen: Screen::Library { sel: 0 },
             library: Vec::new(),
+            folder: String::new(),
             shelf: Vec::new(),
             reader: None,
             battery: None,
@@ -738,7 +796,12 @@ impl<S: Storage> App<S> {
         self.scan_library();
         let last = self.storage.load(LAST_FILE).and_then(|d| String::from_utf8(d).ok());
         if let Some(i) = last.and_then(|f| self.library.iter().position(|b| b.file == f.trim())) {
+            // Opened before the library kept track: as if from the library.
+            let (file, opened) = (self.library[i].file.clone(), self.library[i].opened);
             self.open_book(i);
+            if opened == 0 {
+                self.mark_opened(&file);
+            }
         } else {
             self.screen = Screen::Library { sel: 0 };
         }
@@ -750,60 +813,13 @@ impl<S: Storage> App<S> {
         }
     }
 
-    /// Lists the books, reading titles from the cache file and opening only
-    /// books that are new or changed.
-    fn scan_library(&mut self) {
-        let cached: Vec<BookInfo> = self
-            .storage
-            .load(LIBRARY_FILE)
-            .and_then(|d| String::from_utf8(d).ok())
-            .map(|s| {
-                s.lines()
-                    .filter_map(|l| {
-                        let mut f = l.split('\t');
-                        Some(BookInfo {
-                            file: f.next()?.to_string(),
-                            size: f.next()?.parse().ok()?,
-                            title: f.next()?.to_string(),
-                            author: f.next().unwrap_or("").to_string(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut books = Vec::new();
-        let mut changed = false;
-        for (file, size) in self.storage.list_books() {
-            if let Some(b) = cached.iter().find(|b| b.file == file && b.size == size) {
-                books.push(b.clone());
-                continue;
-            }
-            changed = true;
-            let opened = self.storage.open_book(&file).and_then(Epub::open);
-            let (title, author) = match opened {
-                Ok(e) => (e.title, e.author),
-                Err(_) => (file.clone(), String::from("(can't open this file)")),
-            };
-            books.push(BookInfo { file, size, title, author });
-        }
-        books.sort_by_cached_key(|b| b.title.to_lowercase());
-        if changed || books.len() != cached.len() {
-            let mut s = String::new();
-            for b in &books {
-                s.push_str(&format!("{}\t{}\t{}\t{}\n", b.file, b.size, b.title, b.author));
-            }
-            let _ = self.storage.save(LIBRARY_FILE, s.as_bytes());
-        }
-        self.library = books;
-    }
-
     fn open_book(&mut self, i: usize) {
         let info = self.library[i].clone();
         if self.reader.as_ref().is_some_and(|r| r.info.file == info.file) {
             self.screen = Screen::Reading;
             return;
         }
-        let epub = match self.storage.open_book(&info.file).and_then(Epub::open) {
+        let mut epub = match self.storage.open_book(&info.file).and_then(|f| epub::open(f, &info.file)) {
             Ok(e) => e,
             Err(_) => {
                 self.screen = Screen::Message(format!("Can't open {}", info.file));
@@ -815,6 +831,7 @@ impl<S: Storage> App<S> {
             [s, b, o, ..] => (s as usize, Pos { block: b as u32, byte: o as u32 }),
             _ => (0, Pos::default()),
         };
+        epub.styles = self.settings.book_styles();
         let lang = hyphen::lang(&epub.language);
         let bookmarks = self.storage.load(&book_file(&info, "BMK")).map(|d| bookmarks::parse(&d)).unwrap_or_default();
         let mut reader = Reader {
@@ -874,8 +891,14 @@ impl<S: Storage> App<S> {
     /// Repaginates the open book after a settings change, keeping the place.
     fn relayout(&mut self) {
         let layout = layout(book(&self.fonts, &self.book_fonts), &self.settings, self.book_lang());
+        let styles = self.settings.book_styles();
         if let Some(r) = &mut self.reader {
-            r.repaginate(&layout);
+            if r.epub.styles == styles {
+                r.repaginate(&layout);
+            } else {
+                r.epub.styles = styles;
+                r.reload(&layout);
+            }
         }
         self.save_progress();
     }
@@ -915,8 +938,8 @@ impl<S: Storage> App<S> {
                     }
                     Input::Back if r.away.is_some() => r.go_back(&layout),
                     Input::Back => {
-                        let sel = self.library.iter().position(|b| b.file == r.info.file).unwrap_or(0);
-                        self.screen = Screen::Library { sel };
+                        let file = r.info.file.clone();
+                        self.library_at(Some(&file));
                         return true;
                     }
                 };
@@ -962,6 +985,7 @@ impl<S: Storage> App<S> {
                         MenuItem::Settings => self.screen = Screen::Settings { sel: 0, from_reading: true },
                         MenuItem::System => self.screen = Screen::System { from_reading: true },
                         MenuItem::Library => return self.show_library(),
+                        MenuItem::Delete => self.screen = Screen::Delete { yes: false },
                     },
                 }
                 true
@@ -1019,28 +1043,8 @@ impl<S: Storage> App<S> {
                 }
                 true
             }
-            Screen::Library { sel } => {
-                // The books, then the TOOLS rows.
-                let books = self.library.len();
-                let n = books + TOOLS.len();
-                match input {
-                    Input::Prev => self.screen = Screen::Library { sel: (sel + n - 1) % n },
-                    Input::Next => self.screen = Screen::Library { sel: (sel + 1) % n },
-                    Input::SkipBack | Input::SkipForward => {
-                        let forward = input == Input::SkipForward;
-                        self.screen = Screen::Library { sel: skip_rows(sel, n, rows_per_page(BOOK_ROW), forward) };
-                    }
-                    Input::Menu if sel < books => self.open_book(sel),
-                    Input::Menu => match sel - books {
-                        0 => self.open_transfer(),
-                        1 => self.screen = Screen::Settings { sel: 0, from_reading: false },
-                        _ => self.screen = Screen::System { from_reading: false },
-                    },
-                    Input::Back if self.reader.is_some() => self.screen = Screen::Reading,
-                    _ => return false,
-                }
-                true
-            }
+            Screen::Library { sel } => self.handle_library(input, sel),
+            Screen::Delete { yes } => self.handle_delete(input, yes),
             Screen::Settings { sel, from_reading } => {
                 let n = SETTINGS.len();
                 match input {
@@ -1055,10 +1059,11 @@ impl<S: Storage> App<S> {
                     }
                     Input::Back => {
                         self.relayout();
+                        self.sort_library();
                         self.screen = if from_reading && self.reader.is_some() {
                             Screen::Reading
                         } else {
-                            Screen::Library { sel: self.library.len() + 1 }
+                            self.library_tool(1)
                         };
                     }
                 }
@@ -1071,7 +1076,7 @@ impl<S: Storage> App<S> {
                     self.screen = if from_reading && self.reader.is_some() {
                         Screen::Reading
                     } else {
-                        Screen::Library { sel: self.library.len() + 2 }
+                        self.library_tool(2)
                     };
                 }
                 true
@@ -1123,17 +1128,6 @@ impl<S: Storage> App<S> {
         true
     }
 
-    fn show_library(&mut self) -> bool {
-        self.scan_library();
-        let sel = self
-            .reader
-            .as_ref()
-            .and_then(|r| self.library.iter().position(|b| b.file == r.info.file))
-            .unwrap_or(0);
-        self.screen = Screen::Library { sel };
-        true
-    }
-
     pub fn draw(&mut self, canvas: &mut Canvas) {
         canvas.clear();
         match self.screen.clone() {
@@ -1149,6 +1143,7 @@ impl<S: Storage> App<S> {
             Screen::Library { sel } => self.draw_library(canvas, sel),
             Screen::Settings { sel, .. } => self.draw_settings(canvas, sel),
             Screen::System { .. } => self.draw_system(canvas),
+            Screen::Delete { yes } => self.draw_delete(canvas, yes),
             Screen::Transfer => self.draw_transfer(canvas),
             Screen::Message(m) => {
                 let lines = wrap(&self.fonts, 0, 24, &m, WIDTH - 2 * MARGIN_X, 8);
@@ -1342,74 +1337,6 @@ impl<S: Storage> App<S> {
         self.draw_list(canvas, &title, &rows, sel);
     }
 
-    /// The books with their covers, then the TOOLS rows.
-    fn draw_library(&mut self, canvas: &mut Canvas, sel: usize) {
-        self.draw_header(canvas, "Library");
-        let books = self.library.len();
-        let per_page = rows_per_page(BOOK_ROW);
-        let first = sel / per_page * per_page;
-        for k in first..(books + TOOLS.len()).min(first + per_page) {
-            let y = LIST_TOP + (k - first) as i32 * BOOK_ROW;
-            // Where the row's text starts; selection inverts it from there.
-            let x = if k < books {
-                self.draw_book(canvas, k, y)
-            } else {
-                let (label, help) = TOOLS[k - books];
-                let x = MARGIN_X + 12;
-                self.text(canvas, BOLD, 22, x, y + 58, label);
-                self.text(canvas, ITALIC, 18, x, y + 88, help);
-                x
-            };
-            if k == sel {
-                canvas.invert_rect(x - 12, y + 2, WIDTH - MARGIN_X - x + 12, BOOK_ROW - 4);
-            }
-        }
-        self.draw_list_page(canvas, sel, per_page, books + TOOLS.len());
-        if books == 0 {
-            let y = LIST_TOP + TOOLS.len() as i32 * BOOK_ROW + 48;
-            self.text(canvas, 0, 22, MARGIN_X + 12, y, "No books found.");
-            self.text(canvas, ITALIC, 18, MARGIN_X + 12, y + 36, "Copy .epub files to the SD card, or use Wi-Fi transfer.");
-        }
-    }
-
-    /// Book `i`'s library row at `y`: its cover, then title, author and
-    /// progress. Returns where the text starts.
-    fn draw_book(&mut self, canvas: &mut Canvas, i: usize, y: i32) -> i32 {
-        let at = self.shelved(i);
-        let (cx, cy) = (MARGIN_X + 6, y + (BOOK_ROW - COVER.1) / 2);
-        let percent = self.shelf[at].percent;
-        match &self.shelf[at].cover {
-            Some(g) => {
-                let (x, y) = (cx + (COVER.0 - g.width) / 2, cy + (COVER.1 - g.height) / 2);
-                // A hairline frame keeps white covers apart from the page.
-                canvas.fill_rect(x - 1, y - 1, g.width + 2, g.height + 2, BLACK);
-                g.draw(canvas, x, y);
-            }
-            None => {
-                // A gray card with the title's first letter.
-                canvas.fill_rect(cx, cy, COVER.0, COVER.1, BLACK);
-                canvas.fill_rect(cx + 2, cy + 2, COVER.0 - 4, COVER.1 - 4, 218);
-                let initial: String = self.library[i].title.chars().take(1).collect();
-                let w = self.width(BOLD, 48, &initial);
-                self.text(canvas, BOLD, 48, cx + (COVER.0 - w) / 2, cy + COVER.1 / 2 + 17, &initial);
-            }
-        }
-        let x = cx + COVER.0 + 20;
-        let max = WIDTH - MARGIN_X - 12 - x;
-        let title = wrap(&self.fonts, BOLD, 22, &self.library[i].title, max, 2);
-        let author = fit(&self.fonts, ITALIC, 18, &self.library[i].author, max);
-        let mut base = y + 34;
-        for line in &title {
-            self.text(canvas, BOLD, 22, x, base, line);
-            base += 28;
-        }
-        self.text(canvas, ITALIC, 18, x, base + 2, &author);
-        if let Some(p) = percent {
-            self.text(canvas, 0, STATUS_PX, x, y + BOOK_ROW - 20, &format!("{}% read", p));
-        }
-        x
-    }
-
     /// Book `i`'s cover and progress, from the shelf or else from the card.
     /// Returns its index in the shelf.
     fn shelved(&mut self, i: usize) -> usize {
@@ -1441,7 +1368,7 @@ impl<S: Storage> App<S> {
             // The card can't open a file twice.
             Some(r) if r.info.file == info.file => r.epub.read_cover(),
             // If the book doesn't open, try again another time.
-            _ => self.storage.open_book(&info.file).and_then(Epub::open).ok()?.read_cover(),
+            _ => self.storage.open_book(&info.file).and_then(|f| epub::open(f, &info.file)).ok()?.read_cover(),
         };
         let mut cover = data.and_then(|d| image::decode(&d, COVER.0, COVER.1).ok());
         if let Some(g) = &mut cover {
@@ -1453,7 +1380,7 @@ impl<S: Storage> App<S> {
 
     fn draw_settings(&mut self, canvas: &mut Canvas, sel: usize) {
         self.draw_header(canvas, "Settings");
-        let (top, row_h) = (LIST_TOP, 48);
+        let (top, row_h) = (LIST_TOP, 44);
         let left = MARGIN_X + 12;
         for (i, s) in SETTINGS.iter().enumerate() {
             let y = top + i as i32 * row_h;
@@ -1463,7 +1390,7 @@ impl<S: Storage> App<S> {
                 canvas.invert_rect(MARGIN_X, y + 2, WIDTH - 2 * MARGIN_X, row_h - 4);
             }
         }
-        let y = top + SETTINGS.len() as i32 * row_h + 40;
+        let y = top + SETTINGS.len() as i32 * row_h + 32;
         match self.font_note.clone().filter(|_| sel == FONT) {
             Some(note) => {
                 for (k, line) in wrap(&self.fonts, ITALIC, 18, &note, WIDTH - 2 * left, 2).iter().enumerate() {

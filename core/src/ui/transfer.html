@@ -31,51 +31,124 @@ progress { width: 100%; height: 6px; accent-color: var(--accent); }
 .bad { color: var(--bad); }
 button { font: inherit; font-size: 14px; color: var(--fg); background: none; border: 1px solid var(--line); border-radius: 8px; padding: 4px 12px; cursor: pointer; }
 button:hover { border-color: var(--bad); color: var(--bad); }
+.settings { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 10px 16px; align-items: center; }
+.settings label { font-size: 15px; }
+.to { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; font-size: 15px; }
+li.dir { font-size: 14px; font-weight: 600; color: var(--mute); padding: 18px 0 4px; }
+.to select, .settings select, .settings input { font: inherit; font-size: 15px; color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; min-width: 0; }
+.settings small { grid-column: 2; color: var(--mute); font-size: 13px; margin-top: -6px; }
+.settings button:hover, .settings button:focus-visible { border-color: var(--accent); color: var(--accent); }
 </style>
 </head>
 <body>
 <main>
 <h1>Oxidized<span>Ink</span></h1>
+<p class="to"><label for="folder">Send books to</label><select id="folder"></select></p>
 <div id="drop" tabindex="0">
-  <p><strong>Drop books (.epub) or fonts (.ttf, .otf) here</strong></p>
+  <p><strong>Drop books (.epub, .txt, .md) or fonts (.ttf, .otf) here</strong></p>
   <p class="mute">or click to choose them</p>
-  <input id="pick" type="file" accept=".epub,application/epub+zip,.ttf,.otf" multiple hidden>
+  <input id="pick" type="file" accept=".epub,application/epub+zip,.txt,.md,.markdown,.ttf,.otf" multiple hidden>
 </div>
 <ul id="queue"></ul>
 <h2 id="count">Books</h2>
 <ul id="books"></ul>
-<h2>Firmware</h2>
-<ul><li><div><b id="version">…</b><i>Send an update (a .bin from espflash save-image): the reader checks it, restarts and installs it, which takes about half a minute.</i></div><button id="update">Update</button></li></ul>
-<input id="pickbin" type="file" accept=".bin" hidden>
 <h2>Fonts</h2>
-<p class="mute">Send a family's regular, bold, italic and bold italic files together, up to 1200 KB in all. Pick it on the reader under Settings, Font.</p>
+<p class="mute">Send a family's regular, bold, italic and bold italic files together, up to 1200 KB in all, then pick it under Settings.</p>
 <ul id="fonts"></ul>
+<h2>Settings</h2>
+<form id="settings" class="settings"></form>
+<p class="mute" id="settings-note">The reader uses them once you leave Wi-Fi transfer on it.</p>
+<h2>Network</h2>
+<form id="network" class="settings">
+  <label for="ssid">Name</label><input id="ssid" name="ssid" autocomplete="off" required>
+  <label for="password">Password</label><input id="password" name="password" type="password" placeholder="unchanged" autocomplete="new-password">
+  <span></span><button type="submit">Save network</button>
+</form>
+<p class="mute">Used the next time Wi-Fi transfer starts. An open network has no password.</p>
+<h2>Firmware</h2>
+<ul><li><div><b id="version">…</b></div><button id="update">Update</button></li></ul>
+<p class="mute">Send an update, a .bin from a release: the reader checks it, then restarts and installs it, which takes about half a minute.</p>
+<input id="pickbin" type="file" accept=".bin" hidden>
 </main>
 <script>
 const $ = (s) => document.querySelector(s);
 const el = (tag, text, cls) => { const e = document.createElement(tag); if (text) e.textContent = text; if (cls) e.className = cls; return e; };
 const size = (n) => n < 1e6 ? Math.max(1, Math.round(n / 1e3)) + ' KB' : (n / 1e6).toFixed(1) + ' MB';
 
+// A book's folder: its path without the file name.
+const folderOf = (file) => file.includes('/') ? file.slice(0, file.lastIndexOf('/')) : '';
+const NEW_FOLDER = '\n';
+// Folders made on this page, which the card has once a book is sent to them.
+const madeHere = new Set();
+// The folder chosen to send books to.
+let chosen = '';
+
+// The folders to send books to: the top level, those holding books (and
+// the folders around them), those made here, and a new one.
+function folders(books) {
+  const all = new Set(madeHere);
+  for (const b of books) {
+    const parts = folderOf(b.file).split('/');
+    for (let i = 1; i <= parts.length; i++) if (parts[0]) all.add(parts.slice(0, i).join('/'));
+  }
+  const select = $('#folder');
+  const opt = (value, text) => { const o = el('option', text); o.value = value; return o; };
+  select.replaceChildren(opt('', 'Library'), ...[...all].sort((a, b) => a.localeCompare(b)).map((f) => opt(f, f)), opt(NEW_FOLDER, 'New folder…'));
+  select.value = all.has(chosen) ? chosen : '';
+}
+
+// A folder's name as the reader takes it: up to 3 deep, each name without
+// characters a card can't hold, and not one of the reader's own folders.
+function folderOk(path) {
+  const parts = path.split('/');
+  return parts.length <= 3 && parts.every((p) => p.trim() && p.length <= 64 && !p.startsWith('.') && !/[\\:*?"<>|\x00-\x1f]/.test(p))
+    && !['reader', 'sleep', 'fonts'].includes(parts[0].trim().toLowerCase());
+}
+
+$('#folder').onchange = () => {
+  const select = $('#folder');
+  if (select.value !== NEW_FOLDER) { chosen = select.value; return; }
+  const name = (prompt('New folder (in another: Fiction/Short stories)') || '').split('/').map((p) => p.trim()).join('/');
+  if (name && !folderOk(name)) alert('A folder can be up to 3 deep, and can\'t start with a dot, use \\ : * ? " < > |, or be READER, SLEEP or FONTS.');
+  else if (name) { madeHere.add(name); chosen = name; }
+  load();
+};
+
 async function load() {
   const books = await (await fetch('/books')).json();
   $('#count').textContent = books.length === 1 ? '1 book' : books.length + ' books';
-  $('#books').replaceChildren(...books.map((b) => {
-    const li = el('li'), text = el('div');
-    const title = el('a', b.title);
-    title.href = '/books/' + encodeURIComponent(b.file);
-    title.title = 'Download';
-    text.append(title, el('i', [b.author, size(b.size)].filter(Boolean).join(' · ')));
-    const del = el('button', 'Delete');
-    del.onclick = async () => {
-      if (!confirm('Delete “' + b.title + '” from the reader?')) return;
-      del.disabled = true;
-      const r = await fetch('/books/' + encodeURIComponent(b.file), { method: 'DELETE' });
-      if (!r.ok) alert(await r.text());
-      load();
-    };
-    li.append(text, del);
-    return li;
-  }));
+  folders(books);
+  // Each folder's books together under its name, the top level's first.
+  const byFolder = new Map();
+  for (const b of books) {
+    const f = folderOf(b.file);
+    if (!byFolder.has(f)) byFolder.set(f, []);
+    byFolder.get(f).push(b);
+  }
+  const rows = [];
+  for (const f of [...byFolder.keys()].sort((a, b) => a.localeCompare(b))) {
+    if (f) rows.push(el('li', f, 'dir'));
+    rows.push(...byFolder.get(f).map(bookRow));
+  }
+  $('#books').replaceChildren(...rows);
+}
+
+function bookRow(b) {
+  const li = el('li'), text = el('div');
+  const title = el('a', b.title);
+  title.href = '/books/' + encodeURIComponent(b.file);
+  title.title = 'Download';
+  text.append(title, el('i', [b.author, size(b.size)].filter(Boolean).join(' · ')));
+  const del = el('button', 'Delete');
+  del.onclick = async () => {
+    if (!confirm('Delete “' + b.title + '” from the reader?')) return;
+    del.disabled = true;
+    const r = await fetch('/books/' + encodeURIComponent(b.file), { method: 'DELETE' });
+    if (!r.ok) alert(await r.text());
+    load();
+  };
+  li.append(text, del);
+  return li;
 }
 
 const STYLE_NAMES = { REGULAR: 'Regular', BOLD: 'Bold', ITALIC: 'Italic', BOLDITAL: 'Bold italic', Regular: 'Regular', Bold: 'Bold', Italic: 'Italic', BoldItalic: 'Bold italic' };
@@ -96,6 +169,7 @@ async function loadFonts() {
       const r = await fetch('/fonts/' + encodeURIComponent(f.family), { method: 'DELETE' });
       if (!r.ok) alert(await r.text());
       loadFonts();
+      loadSettings();
     };
     li.append(text, del);
     return li;
@@ -154,8 +228,9 @@ async function add(files) {
   for (const f of files) {
     if (/\.(ttf|otf)$/i.test(f.name)) { fonts.push(f); continue; }
     const { bar, note } = row(f.name);
-    if (!/\.epub$/i.test(f.name)) { fail(note, 'Not an .epub, .ttf or .otf file'); continue; }
-    todo.push({ f, bar, note, url: '/books/' + encodeURIComponent(f.name), sent: () => load() });
+    if (!/\.(epub|txt|md|markdown)$/i.test(f.name)) { fail(note, 'Not a book (.epub, .txt, .md) or a font (.ttf, .otf)'); continue; }
+    const folder = $('#folder').value;
+    todo.push({ f, bar, note, url: '/books/' + encodeURIComponent(folder ? folder + '/' + f.name : f.name), sent: () => load() });
   }
   // Fonts: by family, the file for each style with the weight nearest to
   // 400 (regular, italic) or 700 (bold).
@@ -178,7 +253,7 @@ async function add(files) {
       if (!styles.REGULAR) { fail(note, 'No regular style among the files'); continue; }
       if (total > MAX_FAMILY) { fail(note, 'The family is ' + size(total) + ', more than the reader can load'); continue; }
       const ext = /\.otf$/i.test(f.name) ? 'OTF' : 'TTF';
-      todo.push({ f, bar, note, url: '/fonts/' + encodeURIComponent(family) + '/' + style + '.' + ext, sent: () => loadFonts() });
+      todo.push({ f, bar, note, url: '/fonts/' + encodeURIComponent(family) + '/' + style + '.' + ext, sent: () => { loadFonts(); loadSettings(); } });
     }
   }
   next();
@@ -208,6 +283,49 @@ pick.onchange = () => { add(pick.files); pick.value = ''; };
 drop.ondragover = (e) => { e.preventDefault(); drop.classList.add('over'); };
 drop.ondragleave = () => drop.classList.remove('over');
 drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove('over'); add(e.dataTransfer.files); };
+async function loadSettings() {
+  const r = await (await fetch('/settings')).json();
+  const form = $('#settings');
+  const rows = [];
+  for (const s of r.settings) {
+    const label = el('label', s.label);
+    label.htmlFor = 'set-' + s.key;
+    const select = el('select');
+    select.id = 'set-' + s.key; select.name = s.key;
+    for (const o of s.options) {
+      const opt = el('option', o);
+      opt.value = o;
+      if (o === s.value) opt.selected = true;
+      select.append(opt);
+    }
+    rows.push(label, select, el('small', s.help));
+  }
+  const save = el('button', 'Save settings');
+  save.type = 'submit';
+  rows.push(el('span'), save);
+  form.replaceChildren(...rows);
+  $('#ssid').value = r.network;
+}
+
+async function sendLines(url, lines, note) {
+  const r = await fetch(url, { method: 'PUT', body: lines.join('\n') + '\n' });
+  note.textContent = r.ok ? 'Saved. The reader uses it once you leave Wi-Fi transfer on it.' : await r.text();
+  note.className = r.ok ? 'mute' : 'bad';
+}
+
+$('#settings').onsubmit = (e) => {
+  e.preventDefault();
+  const lines = [...new FormData($('#settings')).entries()].map(([k, v]) => k + ' = ' + v);
+  sendLines('/settings', lines, $('#settings-note'));
+};
+
+$('#network').onsubmit = (e) => {
+  e.preventDefault();
+  const note = $('#network').nextElementSibling;
+  sendLines('/wifi', ['ssid = ' + $('#ssid').value, 'password = ' + $('#password').value], note);
+  $('#password').value = '';
+};
+
 async function loadVersion() {
   const r = await (await fetch('/firmware')).json();
   $('#version').textContent = 'Running ' + r.version;
@@ -227,6 +345,7 @@ $('#pickbin').onchange = () => {
 
 load();
 loadFonts();
+loadSettings();
 loadVersion();
 </script>
 </body>

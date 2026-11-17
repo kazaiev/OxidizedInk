@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use inkreader_core::http::Connection;
 use inkreader_core::render::{gray3, Canvas};
-use inkreader_core::ui::{App, Input, Network, Storage, Upload, HEIGHT, WIDTH};
+use inkreader_core::ui::{App, Input, Network, Storage, Upload, HEIGHT, MAX_FOLDERS, RESERVED_FOLDERS, WIDTH};
 use inkreader_core::{Error, ReadAt};
 
 struct FileBook(File, u64);
@@ -62,6 +62,23 @@ impl Upload for FileUpload {
     }
 }
 
+/// Adds the books in `dir`, which the library calls `shown`, and in the
+/// folders in it, `depth` folders down.
+fn walk(dir: &Path, shown: &str, depth: usize, out: &mut Vec<(String, u64)>) {
+    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let (Ok(name), Ok(meta)) = (e.file_name().into_string(), e.metadata()) else { continue };
+        let path = if shown.is_empty() { name.clone() } else { format!("{shown}/{name}") };
+        if meta.is_dir() {
+            let reserved = depth == 0 && RESERVED_FOLDERS.iter().any(|r| name.eq_ignore_ascii_case(r));
+            if depth < MAX_FOLDERS && !reserved && !name.starts_with('.') {
+                walk(&e.path(), &path, depth + 1, out);
+            }
+        } else if inkreader_core::epub::is_book(&name) {
+            out.push((path, meta.len()));
+        }
+    }
+}
+
 struct DirStorage {
     books: PathBuf,
     state: PathBuf,
@@ -72,13 +89,8 @@ impl Storage for DirStorage {
     type Upload = FileUpload;
 
     fn list_books(&mut self) -> Vec<(String, u64)> {
-        let mut out: Vec<_> = fs::read_dir(&self.books)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("epub")))
-            .filter_map(|e| Some((e.file_name().into_string().ok()?, e.metadata().ok()?.len())))
-            .collect();
+        let mut out = Vec::new();
+        walk(&self.books, "", 0, &mut out);
         out.sort();
         out
     }
@@ -99,12 +111,23 @@ impl Storage for DirStorage {
             }
             file = format!("{stem} ({n}).{ext}");
         }
-        let f = File::create(self.books.join(&file)).map_err(|_| Error::Io)?;
+        let path = self.books.join(&file);
+        if let Some(folder) = path.parent() {
+            fs::create_dir_all(folder).map_err(|_| Error::Io)?;
+        }
+        let f = File::create(path).map_err(|_| Error::Io)?;
         Ok((file, FileUpload(f)))
     }
 
     fn delete_book(&mut self, name: &str) -> Result<(), Error> {
-        fs::remove_file(self.books.join(name)).map_err(|_| Error::Io)
+        let path = self.books.join(name);
+        fs::remove_file(&path).map_err(|_| Error::Io)?;
+        // Folders it leaves empty go too.
+        let mut folder = path.parent();
+        while let Some(f) = folder.filter(|f| *f != self.books && fs::remove_dir(f).is_ok()) {
+            folder = f.parent();
+        }
+        Ok(())
     }
 
     fn load(&mut self, name: &str) -> Option<Vec<u8>> {

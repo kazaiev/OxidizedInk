@@ -11,5 +11,11 @@ rustflags = [
 
 target = "xtensa-esp32-none-elf"
 
+[env]
+# A TLSF heap: the default first-fit list slows down badly once a chapter's
+# thousands of small blocks fragment it (12 s to set a large chapter
+# while the last one is still held, instead of 2 s).
+ESP_ALLOC_CONFIG_HEAP_ALGORITHM = "TLSF"
+
 [unstable]
 build-std = ["alloc", "core"]

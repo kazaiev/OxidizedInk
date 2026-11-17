@@ -13,13 +13,23 @@
 //! Pictures keep their own size in pixels, shrunk to fit the text's width
 //! and the page, with room left for a short caption, which stays with its
 //! picture. One that doesn't fit below the text starts the next page.
+//!
+//! The book's CSS can center a block or set it right, take away a
+//! paragraph's indent or put space around it (see `BlockStyle`); left and
+//! justified paragraphs follow the Alignment setting.
+//!
+//! A table's columns are as wide as their widest cell, or, when the table
+//! doesn't fit, share the room past their longest words in proportion to
+//! what more they'd take. Cells wrap within their columns; a row stays
+//! whole on one page, with a rule between rows.
 
 use alloc::vec::Vec;
+use core::cell::RefCell;
 
 use crate::fonts::{Fonts, Meter};
 use crate::hyphen::{self, Lang};
 use crate::image;
-use crate::text::{Block, BlockKind, Chapter};
+use crate::text::{self, Block, BlockKind, Chapter};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Pos {
@@ -78,6 +88,7 @@ enum Align {
     Justify,
     Left,
     Center,
+    Right,
 }
 
 /// How one block is set.
@@ -153,6 +164,28 @@ fn is_plain(b: &Block) -> bool {
     b.kind == BlockKind::Para && b.indent == 0
 }
 
+/// The table a block is a row of, if it is one.
+fn table_of(b: &Block) -> Option<u16> {
+    match b.kind {
+        BlockKind::Row { table, .. } => Some(table),
+        _ => None,
+    }
+}
+
+/// Tables measured once per layout.
+#[derive(Default)]
+pub struct Tables(RefCell<Vec<Measured>>);
+
+/// A table's columns: each one's widest cell on one line, and its longest
+/// word, in font units. `chapter` and `first` (its first row) say which
+/// table it is.
+struct Measured {
+    chapter: usize,
+    first: usize,
+    widest: Vec<i32>,
+    longest: Vec<i32>,
+}
+
 /// Page geometry and type settings.
 pub struct Layout<'f> {
     pub fonts: &'f Fonts,
@@ -171,6 +204,7 @@ pub struct Layout<'f> {
     pub spaced: bool,
     /// Hyphenate paragraphs' words with these patterns.
     pub hyphenate: Option<Lang>,
+    pub tables: Tables,
 }
 
 impl<'f> Layout<'f> {
@@ -189,20 +223,39 @@ impl<'f> Layout<'f> {
             BlockKind::Heading(3) => (body * 23 / 20, Align::Center),
             BlockKind::Heading(_) => (body, Align::Left),
             BlockKind::Pre => (body * 9 / 10, Align::Left),
-            BlockKind::Center | BlockKind::Image(_) => (body, Align::Center),
+            BlockKind::Image(_) => (body, Align::Center),
             BlockKind::Para | BlockKind::Rule if self.justify => (body, Align::Justify),
             BlockKind::Para | BlockKind::Rule => (body, Align::Left),
+            BlockKind::Row { .. } => (body * 9 / 10, Align::Left),
+        };
+        let align = match (b.style.align, b.kind) {
+            (_, BlockKind::Image(_) | BlockKind::Row { .. }) => align,
+            (Some(text::Align::Center), _) => Align::Center,
+            (Some(text::Align::Right), _) => Align::Right,
+            // A paragraph's left or justified is the reader's to choose.
+            (_, BlockKind::Para) => align,
+            (Some(text::Align::Left | text::Align::Justify), _) => Align::Left,
+            (None, _) => align,
         };
         let indent = (b.indent.min(4) as i32 * body * 3 / 2).min(self.width / 3);
         let follows_para = is_plain(b) && prev.is_some_and(is_plain);
-        let first_indent = if follows_para && !self.spaced { body * 3 / 2 } else { 0 };
+        let indented = follows_para && !self.spaced && !b.style.flush && matches!(align, Align::Justify | Align::Left);
+        let first_indent = if indented { body * 3 / 2 } else { 0 };
         let heading = |b: &Block| matches!(b.kind, BlockKind::Heading(_));
         let gap = match prev {
             None => 0,
+            // A table's rows follow each other.
+            Some(p) if table_of(b).is_some() && table_of(p) == table_of(b) => 0,
             Some(p) if heading(b) && heading(p) => body_line / 4,
             Some(_) if heading(b) => body_line,
             Some(p) if heading(p) => body_line / 2,
-            Some(_) if follows_para => if self.spaced { body_line / 2 } else { 0 },
+            Some(p) if follows_para => {
+                if self.spaced || b.style.above || p.style.below {
+                    body_line / 2
+                } else {
+                    0
+                }
+            }
             Some(p) if p.kind == b.kind && p.indent == b.indent => body_line / 3,
             Some(_) => body_line / 2,
         };
@@ -220,6 +273,11 @@ impl<'f> Layout<'f> {
     /// Finds the end of the line that starts at byte `start` of `b`, given
     /// `avail` font units of width.
     fn break_line(&self, b: &Block, start: usize, avail: i32) -> Break {
+        self.break_line_to(b, start, b.text.len(), avail)
+    }
+
+    /// `break_line` for the text up to byte `end`, such as a table cell.
+    fn break_line_to(&self, b: &Block, start: usize, end: usize, avail: i32) -> Break {
         let pre = b.kind == BlockKind::Pre;
         let lang = self.hyphenate.filter(|_| b.kind == BlockKind::Para);
         let mut meter = Meter::new(self.fonts);
@@ -228,7 +286,7 @@ impl<'f> Layout<'f> {
         let mut word: Option<WordStart> = None;
         let mut width = 0;
         let mut spaces = 0;
-        let text = &b.text[start..];
+        let text = &b.text[start..end];
         let mut chars = text.char_indices().peekable();
         let mut prev = ' ';
         while let Some((rel, c)) = chars.next() {
@@ -290,7 +348,7 @@ impl<'f> Layout<'f> {
             }
             prev = c;
         }
-        Break { end: b.text.len(), next: b.text.len(), width, spaces, hyphen: false, last: true }
+        Break { end, next: end, width, spaces, hyphen: false, last: true }
     }
 
     /// Whether a paragraph line ending at `br` is loose enough to hyphenate
@@ -358,6 +416,7 @@ impl<'f> Layout<'f> {
         let slack = (avail - br.width).max(0);
         let (mut x, stretch) = match st.align {
             Align::Center => (slack / 2, 0),
+            Align::Right => (slack, 0),
             Align::Justify if !br.last && br.spaces > 0 && slack / br.spaces <= fonts.units_per_em => {
                 (0, slack)
             }
@@ -416,7 +475,7 @@ impl<'f> Layout<'f> {
         let mut h = 0;
         for j in i + 1..=last {
             let st = self.style(ch, j);
-            h += st.gap + self.block_height(&ch.blocks[j], &st);
+            h += st.gap + self.block_height(ch, j, &st);
         }
         // A heading keeps the line after it too.
         if last > i && matches!(ch.blocks[last].kind, BlockKind::Heading(_)) && last + 1 < ch.blocks.len() {
@@ -430,16 +489,152 @@ impl<'f> Layout<'f> {
         }
     }
 
-    /// Height of a block's first line, or of its picture and caption.
+    /// Height of a block's first line, or of its picture and caption, or of
+    /// a table row.
     fn lead(&self, ch: &Chapter, i: usize, st: &Style) -> i32 {
         match ch.blocks[i].kind {
             BlockKind::Image(_) => self.image_size(ch, i, st).1 + self.caption_height(ch, i),
+            BlockKind::Row { .. } => self.row(ch, i, st, 0, None),
             _ => st.line_h,
         }
     }
 
+    /// The widest line and the widest word of the text from `start` to
+    /// `end` in `b`, in font units.
+    fn measure(&self, b: &Block, start: usize, end: usize) -> (i32, i32) {
+        let mut meter = Meter::new(self.fonts);
+        let mut styles = Styles::new(b, start);
+        let (mut line, mut word, mut widest, mut longest) = (0, 0, 0, 0);
+        for (rel, c) in b.text[start..end].char_indices() {
+            let face = styles.at(start + rel);
+            match c {
+                '\n' => {
+                    meter.reset();
+                    (line, word) = (0, 0);
+                }
+                ' ' => {
+                    meter.reset();
+                    line += self.fonts.glyph(face, ' ').1;
+                    word = 0;
+                }
+                c => {
+                    let w = meter.next(face, c).2;
+                    line += w;
+                    word += w;
+                }
+            }
+            widest = widest.max(line);
+            longest = longest.max(word);
+        }
+        (widest, longest)
+    }
+
+    /// The columns of the table row `i` is in: each one's left edge and
+    /// width, in pixels.
+    fn columns(&self, ch: &Chapter, i: usize, st: &Style) -> Vec<(i32, i32)> {
+        let table = table_of(&ch.blocks[i]);
+        let same = |j: &usize| table_of(&ch.blocks[*j]) == table;
+        let first = (0..=i).rev().take_while(same).last().unwrap_or(i);
+        let key = ch.blocks.as_ptr() as usize;
+        let mut cache = self.tables.0.borrow_mut();
+        if !cache.iter().any(|m| m.chapter == key && m.first == first) {
+            let (mut widest, mut longest) = (Vec::new(), Vec::new());
+            for b in (first..ch.blocks.len()).take_while(same).map(|j| &ch.blocks[j]) {
+                for (c, &(s, e)) in b.cells.iter().enumerate() {
+                    let (w, l) = self.measure(b, s as usize, e as usize);
+                    if c == widest.len() {
+                        widest.push(0);
+                        longest.push(0);
+                    }
+                    widest[c] = widest[c].max(w);
+                    longest[c] = longest[c].max(l);
+                }
+            }
+            cache.push(Measured { chapter: key, first, widest, longest });
+        }
+        let Measured { widest, longest, .. } = cache.iter().find(|m| m.chapter == key && m.first == first).unwrap();
+        let px = |units: &i32| self.fonts.to_fx(*units, st.px) / 64 + 1;
+        let (widest, longest): (Vec<i32>, Vec<i32>) = (widest.iter().map(px).collect(), longest.iter().map(px).collect());
+        let n = widest.len() as i32;
+        let gap = st.px * 3 / 4;
+        let room = (st.width - gap * (n - 1).max(0)).max(n);
+        let (total, least) = (widest.iter().sum::<i32>(), longest.iter().sum::<i32>());
+        let widths: Vec<i32> = if total <= room {
+            widest
+        } else if least >= room {
+            longest.iter().map(|&l| (l as i64 * room as i64 / least.max(1) as i64) as i32).collect()
+        } else {
+            // Past their longest words, columns share the room left in
+            // proportion to what more they'd take.
+            let more = (total - least).max(1) as i64;
+            let spare = (room - least) as i64;
+            widest.iter().zip(&longest).map(|(&w, &l)| l + ((w - l) as i64 * spare / more) as i32).collect()
+        };
+        let mut x = st.left;
+        widths
+            .into_iter()
+            .map(|w| {
+                let col = (x, w.max(1));
+                x += w + gap;
+                col
+            })
+            .collect()
+    }
+
+    /// Sets table row `i` with its top at `y`, adding its lines and rules to
+    /// `out` if given; returns its height.
+    fn row(&self, ch: &Chapter, i: usize, st: &Style, y: i32, out: Option<&mut Vec<Item>>) -> i32 {
+        let b = &ch.blocks[i];
+        let cols = self.columns(ch, i, st);
+        let pad = st.line_h / 5;
+        // Each cell's lines.
+        let cells: Vec<Vec<(usize, Break)>> = b
+            .cells
+            .iter()
+            .zip(&cols)
+            .map(|(&(s, e), &(_, w))| {
+                let avail = self.fonts.px_to_units(w, st.px);
+                let (mut at, end, mut lines) = (s as usize, e as usize, Vec::new());
+                while at < end {
+                    let br = self.break_line_to(b, at, end, avail);
+                    lines.push((at, br));
+                    at = br.next.max(at + 1);
+                }
+                lines
+            })
+            .collect();
+        let n = cells.iter().map(Vec::len).max().unwrap_or(0).max(1) as i32;
+        let height = n * st.line_h + 2 * pad;
+        let Some(out) = out else { return height };
+        let fonts = self.fonts;
+        let font_h = fonts.to_fx(fonts.ascent + fonts.descent, st.px) / 64;
+        let baseline_off = (st.line_h - font_h) / 2 + fonts.to_fx(fonts.ascent, st.px) / 64;
+        for k in 0..n as usize {
+            let baseline = y + pad + k as i32 * st.line_h + baseline_off;
+            let mut runs = Vec::new();
+            for (lines, &(x, w)) in cells.iter().zip(&cols) {
+                if let Some((at, br)) = lines.get(k) {
+                    let cell = Style { left: x, width: w, first_indent: 0, align: Align::Left, ..*st };
+                    runs.extend(self.build_line(i, b, *at, br, &cell, baseline).runs);
+                }
+            }
+            out.push(Item::Text(Line { block: i as u32, baseline, px: st.px, runs, hyphen: None }));
+        }
+        let x1 = cols.last().map_or(st.left, |&(x, w)| x + w);
+        let first = i == 0 || table_of(&ch.blocks[i - 1]) != table_of(b);
+        if first {
+            out.push(Item::Rule { x0: st.left, x1, y });
+        }
+        out.push(Item::Rule { x0: st.left, x1, y: y + height - 1 });
+        height
+    }
+
     /// Height of a whole block, for keeping a heading with the text after it.
-    fn block_height(&self, b: &Block, st: &Style) -> i32 {
+    fn block_height(&self, ch: &Chapter, i: usize, st: &Style) -> i32 {
+        let b = &ch.blocks[i];
+        if table_of(b).is_some() {
+            return self.row(ch, i, st, 0, None);
+        }
         let mut byte = 0;
         let mut lines = 0;
         while byte < b.text.len() {
@@ -470,7 +665,7 @@ impl<'f> Layout<'f> {
                 let mut need = st.gap + self.lead(ch, bi, &st);
                 if matches!(b.kind, BlockKind::Heading(_)) && bi + 1 < ch.blocks.len() {
                     let next = self.style(ch, bi + 1);
-                    let heading = st.gap + self.block_height(b, &st) + next.gap;
+                    let heading = st.gap + self.block_height(ch, bi, &st) + next.gap;
                     need = heading + self.lead(ch, bi + 1, &next);
                     // A heading and a picture too tall to share a page: keep
                     // the heading with a line's worth instead.
@@ -499,6 +694,13 @@ impl<'f> Layout<'f> {
                 }
                 y += h;
                 empty = false;
+            }
+            if table_of(b).is_some() {
+                y += self.row(ch, bi, &st, y, out.as_deref_mut());
+                empty = false;
+                bi += 1;
+                byte = 0;
+                continue;
             }
             // Center the font's ascent + descent in the line box.
             let font_h = fonts.to_fx(fonts.ascent + fonts.descent, st.px) / 64;
@@ -571,6 +773,7 @@ mod tests {
             justify: true,
             spaced: false,
             hyphenate: Some(Lang::English),
+            tables: Tables::default(),
         };
         let ch = parse_xhtml(
             "<p>Notwithstanding extraordinary circumstances, the representatives \
@@ -629,6 +832,7 @@ mod tests {
             justify: true,
             spaced: false,
             hyphenate: None,
+            tables: Tables::default(),
         };
         let size = |src: &str| {
             let (width, height) = match src {

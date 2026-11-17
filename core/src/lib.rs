@@ -6,6 +6,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod css;
 pub mod epub;
 pub mod firmware;
 pub mod fonts;
@@ -14,6 +15,8 @@ pub mod hyphen;
 pub mod image;
 mod jpeg;
 pub mod layout;
+pub mod mdns;
+pub mod plain;
 mod png;
 pub mod render;
 pub mod settings;

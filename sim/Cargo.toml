@@ -1,6 +1,7 @@
 [package]
 name = "inkreader-sim"
 version = "0.1.0"
+license = "Apache-2.0"
 edition = "2021"
 description = "Runs the reader core on a PC: in a window, or headless writing PNGs"
 

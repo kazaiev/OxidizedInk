@@ -144,6 +144,7 @@ fn layout_covers_all_text() {
                 justify: !plain,
                 spaced: plain,
                 hyphenate: hyphen::lang(&book.language),
+                tables: Default::default(),
             };
             let mut pages = 0;
             let mut measure = 0.0;

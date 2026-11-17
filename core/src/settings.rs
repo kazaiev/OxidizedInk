@@ -26,6 +26,8 @@ pub const PAGE_BUTTONS: usize = 8;
 pub const SLEEP: usize = 9;
 pub const SLEEP_SCREEN: usize = 10;
 pub const FULL_REFRESH: usize = 11;
+pub const LIBRARY_ORDER: usize = 12;
+pub const BOOK_STYLES: usize = 13;
 
 /// The built-in font family, the font setting's default.
 pub const BUILT_IN_FONT: &str = "Literata";
@@ -38,7 +40,7 @@ const MARGIN_PX: [(i32, i32); 3] = [(20, 20), (36, 28), (56, 40)];
 const SLEEP_MINUTES: [u32; 6] = [1, 2, 5, 10, 15, 30];
 const FULL_REFRESH_EVERY: [u32; 4] = [1, 5, 10, 20];
 
-pub const SETTINGS: [Setting; 12] = [
+pub const SETTINGS: [Setting; 14] = [
     // Its options are the built-in family and the folders in /FONTS on the
     // card, kept in `Settings::font` rather than in the table.
     Setting {
@@ -125,6 +127,20 @@ pub const SETTINGS: [Setting; 12] = [
         options: &["Every page", "Every 5", "Every 10", "Every 20"],
         default: 2,
     },
+    Setting {
+        key: "library_order",
+        label: "Library order",
+        help: "Recent: the books opened or added last come first.",
+        options: &["Recent", "Title", "Author", "Added"],
+        default: 0,
+    },
+    Setting {
+        key: "book_styles",
+        label: "Book styles",
+        help: "The book's own centering, bold, italics, hidden text and page breaks.",
+        options: &["On", "Off"],
+        default: 0,
+    },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +166,18 @@ pub enum SleepShows {
     Page,
 }
 
+/// How the library lists books.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryOrder {
+    /// The books opened or added last first.
+    Recent,
+    Title,
+    /// By the author's surname.
+    Author,
+    /// The books added last first.
+    Added,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     /// Option index of each setting.
@@ -169,21 +197,27 @@ impl Settings {
     /// or broken lines fall back to the defaults.
     pub fn parse(data: &[u8]) -> Self {
         let mut s = Settings::default();
+        s.apply(data);
+        s
+    }
+
+    /// Changes the settings that `key = value` lines name, as in the
+    /// settings file, and leaves the others.
+    pub fn apply(&mut self, data: &[u8]) {
         for line in core::str::from_utf8(data).unwrap_or("").lines() {
             let Some((key, value)) = line.split_once('=') else { continue };
             let (key, value) = (key.trim(), value.trim());
             if key == SETTINGS[FONT].key {
                 if !value.is_empty() {
-                    s.font = value.to_string();
+                    self.font = value.to_string();
                 }
                 continue;
             }
             let Some(i) = SETTINGS.iter().position(|d| d.key == key) else { continue };
             if let Some(o) = SETTINGS[i].options.iter().position(|o| o.eq_ignore_ascii_case(value)) {
-                s.values[i] = o as u8;
+                self.values[i] = o as u8;
             }
         }
-        s
     }
 
     pub fn to_text(&self) -> String {
@@ -279,6 +313,20 @@ impl Settings {
     pub fn full_refresh_every(&self) -> u32 {
         FULL_REFRESH_EVERY[self.values[FULL_REFRESH] as usize]
     }
+
+    /// Set books as their CSS says, where it can be read.
+    pub fn book_styles(&self) -> bool {
+        self.values[BOOK_STYLES] == 0
+    }
+
+    pub fn library_order(&self) -> LibraryOrder {
+        match self.values[LIBRARY_ORDER] {
+            0 => LibraryOrder::Recent,
+            1 => LibraryOrder::Title,
+            2 => LibraryOrder::Author,
+            _ => LibraryOrder::Added,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -315,6 +363,13 @@ mod tests {
         assert_eq!(s.font_px(), 32);
         assert_eq!(s.font, "Source Serif 4");
         assert_eq!(d.font, BUILT_IN_FONT);
+
+        // Applying lines changes only what they name.
+        let mut t = s.clone();
+        t.apply(b"margins = Wide\nfont = Literata\n");
+        assert_eq!(t.margins(), (56, 40));
+        assert_eq!(t.font, BUILT_IN_FONT);
+        assert_eq!(t.font_px(), 32);
         assert!(!s.justify());
         assert_eq!(s.margins(), d.margins());
         assert_eq!(Settings::parse(s.to_text().as_bytes()), s);

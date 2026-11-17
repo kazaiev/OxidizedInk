@@ -1,6 +1,7 @@
 [package]
 name = "inkreader-firmware"
 version = "0.1.0"
+license = "Apache-2.0"
 edition = "2021"
 description = "ESP32 firmware for the Inkplate 6: hardware glue around inkreader-core"
 
@@ -35,7 +36,7 @@ inkreader-core = { path = "../core" }
 esp-radio = { version = "=1.0.0-beta.1", features = ["esp32", "wifi", "log-04", "unstable"] }
 esp-rtos = { version = "0.4.0", features = ["esp32", "esp-radio", "esp-alloc", "log-04"] }
 embassy-net-driver = "0.2.0"
-smoltcp = { version = "0.14.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-dhcpv4", "log"] }
+smoltcp = { version = "0.14.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-dhcpv4", "socket-udp", "multicast", "log"] }
 
 [profile.dev]
 # The unoptimized build is too slow and too big for the ESP32.

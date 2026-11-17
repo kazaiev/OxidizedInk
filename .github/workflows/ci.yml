@@ -1,0 +1,45 @@
+# Tests and builds every push to main and every pull request: the core's
+# tests (with two public-domain books from Project Gutenberg for the
+# whole-book tests), the simulator, and the firmware.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Libraries the simulator's window needs
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+      - uses: Swatinem/rust-cache@v2
+      - name: Test books
+        run: |
+          mkdir -p testbooks
+          curl -sfL -o testbooks/pg11.epub https://www.gutenberg.org/ebooks/11.epub3.images || true
+          curl -sfL -o testbooks/pg84.epub https://www.gutenberg.org/ebooks/84.epub3.images || true
+      - run: cargo test --release
+      - run: cargo clippy --all-targets -- -D warnings
+
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: esp-rs/xtensa-toolchain@v1.7.0
+        with:
+          default: true
+          buildtargets: esp32
+          ldproxy: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: firmware
+      - name: Build
+        working-directory: firmware
+        run: cargo build --release

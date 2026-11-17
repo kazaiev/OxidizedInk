@@ -55,15 +55,22 @@ pub enum Network {
     Failed(String),
 }
 
-/// Upload names the page accepts: an `.epub` without directories.
+/// Upload names the page accepts: a book's file (`.epub`, `.txt`, `.md`),
+/// after up to `MAX_FOLDERS` folders to put it in, joined by `/`.
 fn upload_name_ok(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    lower.ends_with(".epub") && lower.len() > 5 && !name.contains(['/', '\\']) && !name.starts_with('.')
+    let mut parts: Vec<&str> = name.split('/').collect();
+    let file = parts.pop().unwrap_or("");
+    let reserved = |f: &str| RESERVED_FOLDERS.iter().any(|r| f.trim().eq_ignore_ascii_case(r));
+    epub::is_book(file)
+        && !file.contains('\\')
+        && !file.starts_with('.')
+        && parts.len() <= MAX_FOLDERS
+        && parts.iter().all(|f| folder_name_ok(f))
+        && !parts.first().is_some_and(|f| reserved(f))
 }
 
-/// A font family's name as the upload page sends it: what a folder can be
-/// called.
-fn family_name_ok(name: &str) -> bool {
+/// What a folder can be called, as for a book folder or a font family.
+fn folder_name_ok(name: &str) -> bool {
     let bad = |c: char| c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|');
     !name.trim().is_empty() && name.len() <= 64 && !name.starts_with('.') && !name.contains(bad)
 }
@@ -107,13 +114,14 @@ impl<S: Storage> App<S> {
     pub fn close_transfer(&mut self) {
         self.scan_library();
         self.transfer_log.clear();
-        // A family sent or deleted may be the one books use.
-        if core::mem::take(&mut self.fonts_changed) {
+        // A family sent or deleted, or settings changed, may change how
+        // the book is set.
+        if core::mem::take(&mut self.fonts_changed) | core::mem::take(&mut self.settings_changed) {
             self.book_family.clear();
             self.load_book_fonts();
             self.relayout();
         }
-        self.screen = Screen::Library { sel: self.library.len() };
+        self.screen = self.library_tool(0);
     }
 
     pub(super) fn handle_transfer(&mut self, input: Input) -> bool {
@@ -161,6 +169,13 @@ impl<S: Storage> App<S> {
                 false
             }
             ("PUT", _) if path == "/firmware" => self.receive_firmware(conn, &mut req),
+            ("GET", _) if path == "/settings" => {
+                let json = self.settings_json();
+                let _ = respond(conn, "200 OK", "application/json", json.as_bytes());
+                false
+            }
+            ("PUT", _) if path == "/settings" => self.receive_settings(conn, &mut req),
+            ("PUT", _) if path == "/wifi" => self.receive_network(conn, &mut req),
             ("GET", _) if path == "/fonts" => {
                 let json = self.fonts_json();
                 let _ = respond(conn, "200 OK", "application/json", json.as_bytes());
@@ -225,7 +240,7 @@ impl<S: Storage> App<S> {
             false
         };
         let parts = rest.split_once('/').and_then(|(f, n)| Some((percent_decode(f)?, percent_decode(n)?)));
-        let Some((family, file)) = parts.filter(|(f, n)| family_name_ok(f) && font_file_ok(n)) else {
+        let Some((family, file)) = parts.filter(|(f, n)| folder_name_ok(f) && font_file_ok(n)) else {
             return fail(conn, "400 Bad Request", "Send .ttf or .otf files from the upload page.");
         };
         if req.length > card_fonts::MAX_FAMILY {
@@ -251,6 +266,98 @@ impl<S: Storage> App<S> {
         let style = crate::fonts::Style::of_file(&file).map_or(String::new(), |s| format!(" ({s:?})"));
         self.transfer_log.push(format!("Received font {family}{style}"));
         self.fonts_changed = true;
+        true
+    }
+
+    /// The settings, each with its label, help, options and value, and the
+    /// network's name, for the page's Settings section.
+    fn settings_json(&mut self) -> String {
+        let mut fonts = Vec::from([String::from(crate::settings::BUILT_IN_FONT)]);
+        fonts.extend(self.storage.list_fonts().into_iter().map(|(f, _)| f).filter(|f| f != crate::settings::BUILT_IN_FONT));
+        let mut out = String::from("{\"settings\":[");
+        for (i, s) in SETTINGS.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"key\":");
+            push_json(&mut out, s.key);
+            out.push_str(",\"label\":");
+            push_json(&mut out, s.label);
+            out.push_str(",\"help\":");
+            push_json(&mut out, s.help);
+            out.push_str(",\"options\":[");
+            let options: Vec<&str> = if i == FONT { fonts.iter().map(String::as_str).collect() } else { s.options.to_vec() };
+            for (k, o) in options.iter().enumerate() {
+                if k > 0 {
+                    out.push(',');
+                }
+                push_json(&mut out, o);
+            }
+            out.push_str("],\"value\":");
+            push_json(&mut out, self.settings.label(i));
+            out.push('}');
+        }
+        out.push_str("],\"network\":");
+        let ssid = self.wifi.as_ref().map_or("", |w| w.ssid.as_str());
+        push_json(&mut out, ssid);
+        out.push('}');
+        out
+    }
+
+    /// Reads a small request body, such as a few `key = value` lines.
+    fn small_body(conn: &mut impl Connection, req: &mut Request) -> Option<Vec<u8>> {
+        if req.length > 4096 {
+            return None;
+        }
+        let mut body = Vec::new();
+        req.body(conn, |chunk| {
+            body.extend_from_slice(chunk);
+            Ok(())
+        })
+        .ok()?;
+        Some(body)
+    }
+
+    /// Changes the settings the body's `key = value` lines name.
+    fn receive_settings(&mut self, conn: &mut impl Connection, req: &mut Request) -> bool {
+        let Some(body) = Self::small_body(conn, req) else {
+            let _ = respond(conn, "400 Bad Request", "text/plain", b"Send settings as key = value lines.");
+            return false;
+        };
+        let before = self.settings.clone();
+        self.settings.apply(&body);
+        if self.settings == before {
+            let _ = respond(conn, "204 No Content", "text/plain", b"");
+            return false;
+        }
+        self.save_settings();
+        self.settings_changed = true;
+        let _ = respond(conn, "204 No Content", "text/plain", b"");
+        self.transfer_log.push(String::from("Changed the settings"));
+        true
+    }
+
+    /// Replaces the network in `WIFI.TXT` with the body's `ssid = ...` and
+    /// `password = ...`; an empty password keeps the old one for the same
+    /// network. It's used the next time Wi-Fi transfer starts.
+    fn receive_network(&mut self, conn: &mut impl Connection, req: &mut Request) -> bool {
+        let Some(mut wifi) = Self::small_body(conn, req).and_then(|b| Wifi::parse(&b)) else {
+            let _ = respond(conn, "400 Bad Request", "text/plain; charset=utf-8", "The network needs a name.".as_bytes());
+            return false;
+        };
+        if wifi.password.is_empty() {
+            if let Some(old) = self.wifi.as_ref().filter(|w| w.ssid == wifi.ssid) {
+                wifi.password = old.password.clone();
+            }
+        }
+        let text = format!("ssid = {}\npassword = {}\n", wifi.ssid, wifi.password);
+        if self.storage.save(WIFI_FILE, text.as_bytes()).is_err() {
+            let _ = respond(conn, "500 Internal Server Error", "text/plain", b"Couldn't save the network on the card.");
+            return false;
+        }
+        let _ = respond(conn, "204 No Content", "text/plain", b"");
+        self.transfer_log.push(format!("Network set to {}", wifi.ssid));
+        self.wifi = Some(wifi);
         true
     }
 
@@ -307,7 +414,7 @@ impl<S: Storage> App<S> {
 
     /// Deletes a font family's files.
     fn delete_family(&mut self, conn: &mut impl Connection, rest: &str) -> bool {
-        let Some(family) = percent_decode(rest).filter(|f| family_name_ok(f)) else {
+        let Some(family) = percent_decode(rest).filter(|f| folder_name_ok(f)) else {
             let _ = respond(conn, "404 Not Found", "text/plain", b"No such font.");
             return false;
         };
@@ -353,9 +460,16 @@ impl<S: Storage> App<S> {
         // The title as a file name, in plain ASCII.
         let safe: String = info.title.chars().filter(|c| c.is_ascii_alphanumeric() || " -_,.'()".contains(*c)).collect();
         let name = if safe.trim().is_empty() { "book" } else { safe.trim() };
-        let extra = format!("Content-Disposition: attachment; filename=\"{}.epub\"\r\n", name);
+        // The file's own extension, and the type that goes with it.
+        let ext = info.file.rsplit_once('.').map_or("epub", |(_, e)| e).to_ascii_lowercase();
+        let (ext, mime) = match ext.as_str() {
+            "txt" => ("txt", "text/plain; charset=utf-8"),
+            "md" | "markdown" => ("md", "text/markdown; charset=utf-8"),
+            _ => ("epub", "application/epub+zip"),
+        };
+        let extra = format!("Content-Disposition: attachment; filename=\"{}.{}\"\r\n", name, ext);
         let size = file.size();
-        if respond_head(conn, "200 OK", "application/epub+zip", size, &extra).is_err() {
+        if respond_head(conn, "200 OK", mime, size, &extra).is_err() {
             return;
         }
         let mut buf = alloc::vec![0u8; 8192];
@@ -376,7 +490,7 @@ impl<S: Storage> App<S> {
             false
         };
         let Some(name) = percent_decode(name).filter(|n| upload_name_ok(n)) else {
-            return fail(conn, "400 Bad Request", "Only .epub files can be sent.");
+            return fail(conn, "400 Bad Request", "Only books can be sent: .epub, .txt or .md files, in folders up to 3 deep.");
         };
         let Ok((file, mut upload)) = self.storage.create_book(&name) else {
             return fail(conn, "500 Internal Server Error", "Couldn't make the file on the card.");
@@ -392,9 +506,9 @@ impl<S: Storage> App<S> {
             let _ = self.storage.delete_book(&file);
             return fail(conn, "500 Internal Server Error", "Writing to the card failed.");
         }
-        if self.storage.open_book(&file).and_then(Epub::open).is_err() {
+        if self.storage.open_book(&file).and_then(|f| epub::open(f, &file)).is_err() {
             let _ = self.storage.delete_book(&file);
-            return fail(conn, "422 Unprocessable Entity", "This isn't an EPUB the reader can open.");
+            return fail(conn, "422 Unprocessable Entity", "This isn't a book the reader can open.");
         }
         self.scan_library();
         let title = self.library.iter().find(|b| b.file == file).map_or(name, |b| b.title.clone());
@@ -413,18 +527,10 @@ impl<S: Storage> App<S> {
             let _ = respond(conn, "404 Not Found", "text/plain", b"No such book.");
             return false;
         };
-        // The card can't delete an open file.
-        if self.reader.as_ref().is_some_and(|r| r.info.file == info.file) {
-            self.reader = None;
-        }
-        if self.storage.delete_book(&info.file).is_err() {
+        if self.remove_book(&info).is_err() {
             let _ = respond(conn, "500 Internal Server Error", "text/plain", b"Couldn't delete the file.");
             return false;
         }
-        for ext in ["POS", "THM", "BMK"] {
-            self.storage.remove(&book_file(&info, ext));
-        }
-        self.scan_library();
         let _ = respond(conn, "204 No Content", "text/plain", b"");
         self.transfer_log.push(format!("Deleted {}", info.title));
         true
@@ -453,10 +559,21 @@ impl<S: Storage> App<S> {
             Network::Ready(address) => {
                 y = self.paragraph(canvas, 0, x, y, max, &format!("On a computer or phone on {}, open:", ssid));
                 y += 60;
-                let w = self.width(BOLD, 30, &address);
-                self.text(canvas, BOLD, 30, x + (max - w).max(0) / 2, y, &address);
+                // The name, when the platform answers for it; some phones
+                // only find the address.
+                let (first, second) = match self.local_name {
+                    Some(name) => (format!("http://{name}/"), Some(format!("or {address}"))),
+                    None => (address.clone(), None),
+                };
+                let w = self.width(BOLD, 30, &first);
+                self.text(canvas, BOLD, 30, x + (max - w).max(0) / 2, y, &first);
+                if let Some(second) = second {
+                    y += 40;
+                    let w = self.width(0, 22, &second);
+                    self.text(canvas, 0, 22, x + (max - w).max(0) / 2, y, &second);
+                }
                 y += 60;
-                y = self.paragraph(canvas, 0, x, y, max, "Drop .epub files on that page to send them here. You can delete books there too.");
+                y = self.paragraph(canvas, 0, x, y, max, "There you can send and delete books and fonts, change settings, and update the reader.");
                 y += 16;
                 for line in self.transfer_log.clone() {
                     y += 30;
@@ -476,7 +593,7 @@ impl<S: Storage> App<S> {
 
     /// Draws `s` in 22-pixel lines from baseline `y`, wrapped to `max`
     /// pixels. Returns the last line's baseline.
-    fn paragraph(&mut self, canvas: &mut Canvas, face: u8, x: i32, y: i32, max: i32, s: &str) -> i32 {
+    pub(super) fn paragraph(&mut self, canvas: &mut Canvas, face: u8, x: i32, y: i32, max: i32, s: &str) -> i32 {
         let lines: Vec<String> = wrap(&self.fonts, face, 22, s, max, 12);
         let mut base = y;
         for (i, line) in lines.iter().enumerate() {
@@ -504,7 +621,15 @@ mod tests {
     fn upload_names() {
         assert!(upload_name_ok("Pride and Prejudice.EPUB"));
         assert!(!upload_name_ok("../x.epub"));
-        assert!(!upload_name_ok("notes.txt"));
+        assert!(upload_name_ok("notes.txt"));
+        assert!(upload_name_ok("README.md"));
+        assert!(!upload_name_ok("picture.png"));
         assert!(!upload_name_ok(".epub"));
+        assert!(upload_name_ok("Fiction/Old/Кобзар.epub"));
+        assert!(!upload_name_ok("a/b/c/d/deep.epub"));
+        assert!(!upload_name_ok("Fiction//x.epub"));
+        assert!(!upload_name_ok("reader/x.epub"));
+        assert!(upload_name_ok("Fiction/Reader/x.epub"));
+        assert!(!upload_name_ok("Fiction/x.epub/"));
     }
 }

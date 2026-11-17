@@ -102,6 +102,7 @@ fn layout(fonts: &Fonts) -> Layout<'_> {
         justify: true,
         spaced: false,
         hyphenate: Some(Lang::English),
+        tables: Default::default(),
     }
 }
 
@@ -136,6 +137,12 @@ fn benchmark_book(sd: &Sd, e: &Entry, fonts: &Fonts, canvas: &mut Canvas, render
     }
     let layout = layout(fonts);
     for i in picks {
+        // Without the book's CSS first, for what reading it costs.
+        epub.styles = false;
+        let t = Instant::now();
+        let plain = epub.chapter(i).map(|c| c.blocks.len()).unwrap_or(0);
+        let without = ms(t);
+        epub.styles = true;
         let t = Instant::now();
         let ch = match epub.chapter(i) {
             Ok(c) => c,
@@ -145,6 +152,11 @@ fn benchmark_book(sd: &Sd, e: &Entry, fonts: &Fonts, canvas: &mut Canvas, render
             }
         };
         let parse = ms(t);
+        // Again while it's held, as when the reader moves to a chapter.
+        let t = Instant::now();
+        let _again = epub.chapter(i);
+        info!("  chapter {}: {} blocks ({} without CSS) parsed in {} ms, {} ms without CSS, {} ms with another held", i, ch.blocks.len(), plain, parse, without, ms(t));
+        drop(_again);
         let t = Instant::now();
         let starts = layout.paginate(&ch);
         let paginate = ms(t);

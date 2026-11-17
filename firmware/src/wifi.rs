@@ -32,7 +32,8 @@ use inkreader_core::ui::Wifi;
 use inkreader_core::Error;
 use log::{info, warn};
 use smoltcp::iface::{Config as IfaceConfig, Interface as Iface, SocketHandle, SocketSet};
-use smoltcp::socket::{dhcpv4, tcp};
+use inkreader_core::mdns;
+use smoltcp::socket::{dhcpv4, tcp, udp};
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address};
 
 use crate::psram;
@@ -123,6 +124,8 @@ pub struct Net {
     sockets: SocketSet<'static>,
     dhcp: SocketHandle,
     listeners: [SocketHandle; LISTENERS],
+    /// Answers for the reader's name on the network (see `mdns`).
+    names: SocketHandle,
     /// From DHCP, once there is one.
     pub address: Option<Ipv4Address>,
 }
@@ -172,7 +175,11 @@ impl Net {
             let tx = tcp::SocketBuffer::new(psram::slice(TX_BUFFER, || 0u8));
             sockets.add(tcp::Socket::new(rx, tx))
         });
-        Ok(Net { controller, device, iface, sockets, dhcp, listeners, address: None })
+        let packets = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 2048]);
+        let mut names = udp::Socket::new(packets(), packets());
+        let _ = names.bind(mdns::PORT);
+        let names = sockets.add(names);
+        Ok(Net { controller, device, iface, sockets, dhcp, listeners, names, address: None })
     }
 
     /// Joins the network, and asks for an address again. On failure, says
@@ -224,6 +231,13 @@ impl Net {
                 }
                 self.address = Some(c.address.address());
                 changed = true;
+                // Answer for the reader's name, and say so.
+                let group = Ipv4Address::from(mdns::GROUP);
+                if let Err(e) = self.iface.join_multicast_group(group) {
+                    warn!("can't join the mDNS group: {:?}", e);
+                }
+                let announce = mdns::announce(mdns::NAME, c.address.address().octets());
+                let _ = self.sockets.get_mut::<udp::Socket>(self.names).send_slice(&announce, (group, mdns::PORT));
             }
             // The socket also says this once when it starts.
             Some(dhcpv4::Event::Deconfigured) if self.address.is_some() => {
@@ -238,6 +252,16 @@ impl Net {
             let s = self.sockets.get_mut::<tcp::Socket>(h);
             if !s.is_open() {
                 let _ = s.listen(80);
+            }
+        }
+        if let Some(ip) = self.address {
+            let names = self.sockets.get_mut::<udp::Socket>(self.names);
+            let mut query = [0u8; 512];
+            while let Ok((n, meta)) = names.recv_slice(&mut query) {
+                if let Some((reply, unicast)) = mdns::answer(&query[..n], mdns::NAME, ip.octets(), meta.endpoint.port) {
+                    let to = if unicast { meta.endpoint } else { (Ipv4Address::from(mdns::GROUP), mdns::PORT).into() };
+                    let _ = names.send_slice(&reply, to);
+                }
             }
         }
         changed

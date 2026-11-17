@@ -393,6 +393,13 @@ impl Sd {
         dir.delete_entry_in_dir(name)?;
         self.card.flush()
     }
+
+    /// Deletes an empty folder in a directory (`""` for the root). As with
+    /// files, its first cluster stays in use.
+    pub fn remove_dir(&self, path: &str, name: &str) -> Result<(), SdError> {
+        self.dir(path)?.delete_entry_in_dir(name)?;
+        self.card.flush()
+    }
 }
 
 /// An open SD card file as the core's random-access reader.
